@@ -1,0 +1,21 @@
+# Copyright The OpenTelemetry Authors
+# SPDX-License-Identifier: Apache-2.0
+
+# ********************************
+# WARNING: NOT HERMETIC !!!!!!!!!!
+# ********************************
+#
+# Oldest test-only dependency pins.
+#
+# The package's own declared deps (qwen-agent via the instruments extra plus the
+# opentelemetry-* packages and opentelemetry-util-genai) are resolved to their
+# pyproject.toml floors by UV_RESOLUTION=lowest-direct on the oldest tox factor,
+# so they are NOT pinned here — pyproject.toml is the single source of truth.
+# The OpenTelemetry SDK and test utilities come transitively from
+# opentelemetry-test-util-genai, which every oldest env installs. Pin here only
+# test-only deps that nothing else already provides.
+
+numpy>=1.24.0
+soundfile>=0.12.0
+python-dateutil>=2.8.0
+pyyaml>=6.0
