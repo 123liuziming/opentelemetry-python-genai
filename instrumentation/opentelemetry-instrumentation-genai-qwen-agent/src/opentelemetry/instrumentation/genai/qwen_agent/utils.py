@@ -11,14 +11,15 @@ import logging
 from typing import TYPE_CHECKING, Any, cast
 
 from opentelemetry.util.genai.handler import TelemetryHandler
-from opentelemetry.util.genai.invocation import AgentInvocation
+from opentelemetry.util.genai.invocation import LocalAgentInvocation
 from opentelemetry.util.genai.types import (
     InputMessage,
     MessagePart,
     OutputMessage,
-    Text,
-    ToolCallRequest,
-    ToolCallResponse,
+    Role,
+    TextPart,
+    ToolCallRequestPart,
+    ToolCallResponsePart,
 )
 
 if TYPE_CHECKING:
@@ -98,7 +99,7 @@ def find_tool_call_id(
         function_id = (
             _field_value(extra, "function_id") if extra is not None else None
         )
-        if _field_value(msg, "role") in ("function", "tool"):
+        if _field_value(msg, "role") in ("function", Role.TOOL.value):
             if function_id:
                 responded.add(str(function_id))
             continue
@@ -116,7 +117,7 @@ def find_tool_call_id(
     return None
 
 
-def _function_call_part(function_call: Any) -> ToolCallRequest:
+def _function_call_part(function_call: Any) -> ToolCallRequestPart:
     name = _field_value(function_call, "name") or ""
     arguments = _field_value(function_call, "arguments") or "{}"
     if isinstance(arguments, str):
@@ -124,7 +125,7 @@ def _function_call_part(function_call: Any) -> ToolCallRequest:
             arguments = json.loads(arguments)
         except (json.JSONDecodeError, ValueError):
             pass
-    return ToolCallRequest(name=name, arguments=arguments, id=None)
+    return ToolCallRequestPart(name=name, arguments=arguments, id=None)
 
 
 def _tool_call_response_id(msg: Any) -> str:
@@ -152,7 +153,7 @@ def convert_to_input_messages(
     input_messages: list[InputMessage] = []
     for msg in messages:
         try:
-            role = _field_value(msg, "role") or "user"
+            role = _field_value(msg, "role") or Role.USER.value
             content = _field_value(msg, "content") or ""
             function_call = _field_value(msg, "function_call")
 
@@ -163,9 +164,9 @@ def convert_to_input_messages(
 
             # qwen-agent uses role="function" internally, but the DashScope
             # API converts it to role="tool"; handle both.
-            if role in ("function", "tool") and content:
+            if role in ("function", Role.TOOL.value) and content:
                 parts.append(
-                    ToolCallResponse(
+                    ToolCallResponsePart(
                         id=_tool_call_response_id(msg),
                         response=_extract_content_text(content),
                     )
@@ -173,7 +174,7 @@ def convert_to_input_messages(
             elif content:
                 text = _extract_content_text(content)
                 if text:
-                    parts.append(Text(content=text))
+                    parts.append(TextPart(content=text))
 
             if parts:
                 input_messages.append(InputMessage(role=role, parts=parts))
@@ -205,19 +206,19 @@ def convert_to_output_messages(
 
             if function_call:
                 parts.append(_function_call_part(function_call))
-                finish_reason = "tool_calls"
+                finish_reason = "tool_call"
 
             if content:
                 text = _extract_content_text(content)
                 if text:
-                    parts.append(Text(content=text))
+                    parts.append(TextPart(content=text))
 
             if not parts:
-                parts.append(Text(content=""))
+                parts.append(TextPart(content=""))
 
             output_messages.append(
                 OutputMessage(
-                    role="assistant",
+                    role=Role.ASSISTANT.value,
                     parts=parts,
                     finish_reason=finish_reason,
                 )
@@ -246,11 +247,11 @@ def convert_to_final_output_messages(
 
     for msg in reversed(messages):
         try:
-            role = _field_value(msg, "role") or "assistant"
+            role = _field_value(msg, "role") or Role.ASSISTANT.value
             function_call = _field_value(msg, "function_call")
             content = _field_value(msg, "content") or ""
 
-            if role in ("function", "tool") or function_call:
+            if role in ("function", Role.TOOL.value) or function_call:
                 continue
 
             if _extract_content_text(content):
@@ -268,7 +269,7 @@ def create_agent_invocation(
     handler: TelemetryHandler,
     agent_instance: Any,
     messages: QwenMessage | list[QwenMessage] | None,
-) -> AgentInvocation:
+) -> LocalAgentInvocation:
     """Create and start an AgentInvocation for Agent.run()."""
     llm_instance = getattr(agent_instance, "llm", None)
     agent_name = (
@@ -293,6 +294,6 @@ def create_agent_invocation(
         # qwen-agent prepends to the LLM messages on every run.
         system_message = getattr(agent_instance, "system_message", None)
         if system_message:
-            invocation.system_instruction = [Text(content=system_message)]
+            invocation.system_instruction = [TextPart(content=system_message)]
 
     return invocation

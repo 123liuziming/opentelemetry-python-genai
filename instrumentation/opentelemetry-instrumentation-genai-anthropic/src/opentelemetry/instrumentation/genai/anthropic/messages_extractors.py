@@ -5,10 +5,15 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
+from urllib.parse import urlparse
 
+try:
+    import httpx2 as _http_lib
+except ImportError:
+    import httpx as _http_lib
 from anthropic.types import MessageDeltaUsage
 
 from opentelemetry.semconv._incubating.attributes import (
@@ -19,9 +24,13 @@ from opentelemetry.semconv._incubating.attributes import (
 )
 from opentelemetry.util.genai.invocation import InferenceInvocation
 from opentelemetry.util.genai.types import (
+    FunctionToolDefinition,
+    GenericToolDefinition,
     InputMessage,
-    MessagePart,
     OutputMessage,
+    SystemInstructionPart,
+    TextPart,
+    ToolDefinition,
 )
 from opentelemetry.util.types import AttributeValue
 
@@ -31,9 +40,8 @@ from .utils import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Iterable
 
-    import httpx
     from anthropic.resources.messages import AsyncMessages, Messages
     from anthropic.types import (
         Message,
@@ -58,18 +66,14 @@ class MessageRequestParams:
     stream: bool | None = None
     messages: Iterable[MessageParam] | None = None
     system: str | Iterable[TextBlockParam] | None = None
-
-
-GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS = (
-    "gen_ai.usage.cache_creation.input_tokens"
-)
-GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS = "gen_ai.usage.cache_read.input_tokens"
+    tools: Iterable[ToolUnionParam] | None = None
 
 
 @dataclass
 class UsageTokens:
     input_tokens: int | None = None
     output_tokens: int | None = None
+    thinking_tokens: int | None = None
     cache_creation_input_tokens: int | None = None
     cache_read_input_tokens: int | None = None
 
@@ -82,6 +86,8 @@ def extract_usage_tokens(
 
     input_tokens = usage.input_tokens
     output_tokens = usage.output_tokens
+    output_tokens_details = getattr(usage, "output_tokens_details", None)
+    thinking_tokens = getattr(output_tokens_details, "thinking_tokens", None)
     cache_creation_input_tokens = usage.cache_creation_input_tokens
     cache_read_input_tokens = usage.cache_read_input_tokens
 
@@ -101,6 +107,7 @@ def extract_usage_tokens(
     return UsageTokens(
         input_tokens=total_input_tokens,
         output_tokens=output_tokens,
+        thinking_tokens=thinking_tokens,
         cache_creation_input_tokens=cache_creation_input_tokens,
         cache_read_input_tokens=cache_read_input_tokens,
     )
@@ -121,10 +128,68 @@ def get_input_messages(
 
 def get_system_instruction(
     system: str | Iterable[TextBlockParam] | None,
-) -> list[MessagePart]:
+) -> list[SystemInstructionPart]:
     if system is None:
         return []
-    return convert_content_to_parts(system)
+    if isinstance(system, str):
+        return [TextPart(content=system)] if system else []
+    return [
+        TextPart(content=block["text"])
+        for block in system
+        if block.get("text")
+    ]
+
+
+def _tool_field(tool: object, key: str) -> object:
+    if isinstance(tool, Mapping):
+        return cast("Mapping[str, object]", tool).get(key)
+    return getattr(tool, key, None)
+
+
+def get_tool_definitions(
+    tools: Iterable[ToolUnionParam] | None,
+) -> list[ToolDefinition] | None:
+    """Convert the request's ``tools`` into semconv tool definitions.
+
+    A custom tool carries its JSON schema in ``input_schema`` and maps onto a
+    function definition. Server tools are identified by a versioned ``type``
+    (``web_search_20250305``, ``bash_20250124``, ...) and toolsets
+    (``computer_toolset_20260801``, ...) carry no ``name`` at all, so their type
+    stands in for the name.
+    """
+    if tools is None:
+        return None
+
+    definitions: list[ToolDefinition] = []
+    for tool in tools:
+        name = _tool_field(tool, "name")
+        tool_type = _tool_field(tool, "type")
+        input_schema = _tool_field(tool, "input_schema")
+        if input_schema is not None or tool_type in (None, "custom"):
+            description = _tool_field(tool, "description")
+            definitions.append(
+                FunctionToolDefinition(
+                    name=name if isinstance(name, str) else "",
+                    description=(
+                        description if isinstance(description, str) else None
+                    ),
+                    # The schema requires an object; drop anything else rather
+                    # than emit a tool definition that fails validation.
+                    parameters=(
+                        input_schema
+                        if isinstance(input_schema, Mapping)
+                        else None
+                    ),
+                )
+            )
+        elif isinstance(tool_type, str):
+            definitions.append(
+                GenericToolDefinition(
+                    name=name if isinstance(name, str) else tool_type,
+                    type=tool_type,
+                )
+            )
+    return definitions or None
 
 
 def get_output_messages_from_message(
@@ -139,7 +204,7 @@ def get_output_messages_from_message(
         OutputMessage(
             role=message.role,
             parts=parts,
-            finish_reason=finish_reason or "",
+            finish_reason=finish_reason,
         )
     ]
 
@@ -162,14 +227,9 @@ def set_invocation_response_attributes(
     tokens = extract_usage_tokens(message.usage)
     invocation.input_tokens = tokens.input_tokens
     invocation.output_tokens = tokens.output_tokens
-    if tokens.cache_creation_input_tokens is not None:
-        invocation.attributes[GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS] = (
-            tokens.cache_creation_input_tokens
-        )
-    if tokens.cache_read_input_tokens is not None:
-        invocation.attributes[GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS] = (
-            tokens.cache_read_input_tokens
-        )
+    invocation.thinking_tokens = tokens.thinking_tokens
+    invocation.cache_write_input_tokens = tokens.cache_creation_input_tokens
+    invocation.cache_read_input_tokens = tokens.cache_read_input_tokens
 
     if capture_content:
         invocation.output_messages = get_output_messages_from_message(message)
@@ -194,9 +254,35 @@ def extract_params(  # pylint: disable=too-many-locals
     extra_headers: Mapping[str, str] | None = None,
     extra_query: Mapping[str, object] | None = None,
     extra_body: object | None = None,
-    timeout: float | httpx.Timeout | None = None,
+    timeout: float | _http_lib.Timeout | None = None,
     **_kwargs: object,
 ) -> MessageRequestParams:
+    if isinstance(extra_body, Mapping):
+        body = cast(Mapping[object, object], extra_body)
+        body_temperature = body.get("temperature")
+        if (
+            temperature is None
+            and isinstance(body_temperature, (int, float))
+            and not isinstance(body_temperature, bool)
+        ):
+            temperature = float(body_temperature)
+
+        body_top_p = body.get("top_p")
+        if (
+            top_p is None
+            and isinstance(body_top_p, (int, float))
+            and not isinstance(body_top_p, bool)
+        ):
+            top_p = float(body_top_p)
+
+        body_top_k = body.get("top_k")
+        if (
+            top_k is None
+            and isinstance(body_top_k, int)
+            and not isinstance(body_top_k, bool)
+        ):
+            top_k = body_top_k
+
     return MessageRequestParams(
         model=model,
         max_tokens=max_tokens,
@@ -207,18 +293,30 @@ def extract_params(  # pylint: disable=too-many-locals
         stream=stream,
         messages=messages,
         system=system,
+        tools=tools,
     )
 
 
 def get_server_address_and_port(
     client_instance: Messages | AsyncMessages,
 ) -> tuple[str | None, int | None]:
-    base_url = client_instance._client.base_url
-    port = base_url.port
-    return (
-        base_url.host or None,
-        port if port and port != 443 and port > 0 else None,
-    )
+    base_client = getattr(client_instance, "_client", None)
+    base_url = getattr(base_client, "base_url", None)
+    if not base_url:
+        return None, None
+
+    server_address = getattr(base_url, "host", None)
+    server_port = getattr(base_url, "port", None)
+
+    if server_address is None:
+        parsed = urlparse(str(base_url))
+        server_address = parsed.hostname
+        server_port = parsed.port
+
+    if server_port in (80, 443):
+        server_port = None
+
+    return server_address, server_port
 
 
 def get_llm_request_attributes(

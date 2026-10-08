@@ -24,11 +24,13 @@ project.
 │   └── opentelemetry-instrumentation-genai-<name>/  # one package per GenAI library
 │       ├── src/opentelemetry/instrumentation/genai/<name>/
 │       ├── tests/
+│       ├── CHANGELOG.md
 │       └── pyproject.toml
 └── util/
     └── opentelemetry-util-genai/              # shared GenAI utilities
         ├── src/opentelemetry/util/genai/
         ├── tests/
+        ├── CHANGELOG.md
         └── pyproject.toml
 ```
 
@@ -134,12 +136,12 @@ This repo ships skills (under `.github/skills/`) that automate the heavy,
 repeatable contribution flows. Trigger them deliberately when
 you start one of these tasks:
 
-- **`migrate-from-openinference`** — migrate an `openinference-instrumentation-*`
+- [**`migrate-from-openinference`**](.github/skills/migrate-from-openinference/SKILL.md) — migrate an `openinference-instrumentation-*`
   package into this repo as an OTel GenAI package, or augment an existing
   package with the coverage OpenInference adds on top.
-- **`review-migration`** — review a ported or augmented package against its
+- [**`review-migration`**](.github/skills/review-migration/SKILL.md) — review a ported or augmented package against its
   upstream implementation and write `MIGRATION_REPORT.md`.
-- **`write-conformance-tests`** — author conformance scenarios and the
+- [**`write-conformance-tests`**](.github/skills/write-conformance-tests/SKILL.md) — author conformance scenarios and the
   `test_conformance.py` runner for an instrumentation package.
 
 Please contribute back anything you learn while using the skills that could help improve them!
@@ -263,6 +265,7 @@ For more information about the maintainer role, see the [community repository](h
 - [Mike Goldsmith](https://github.com/MikeGoldsmith), Honeycomb
 - [Keith Decker](https://github.com/keith-decker), Cisco
 - [Leighton Chen](https://github.com/lzchen), Microsoft
+- [Radhika Gupta](https://github.com/rads-1996), Microsoft
 
 For more information about the approver role, see the [community repository](https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md#approver).
 

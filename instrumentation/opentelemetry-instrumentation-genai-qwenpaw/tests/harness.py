@@ -45,12 +45,13 @@ def make_request(
 
 def fake_run_command_path(
     response_text: str = "ok",
+    last: bool = True,
 ) -> Callable[..., AsyncGenerator[Any, None]]:
     """A ``run_command_path`` stand-in yielding one assistant reply."""
 
     async def _fake(request: Any, msgs: Any, runner: Any):
         del request, msgs, runner
-        yield assistant_reply(response_text), True
+        yield assistant_reply(response_text), last
 
     return _fake
 

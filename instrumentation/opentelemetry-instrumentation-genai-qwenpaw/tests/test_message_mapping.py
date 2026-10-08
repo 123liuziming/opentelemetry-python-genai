@@ -73,7 +73,7 @@ def test_output_message_from_yield_item():
     output = output_message_from_yield_item((assistant, True))
     assert output is not None
     assert output.role == "assistant"
-    assert output.finish_reason == "stop"
+    assert output.finish_reason is None
     assert output.parts[0].content == "done"
 
     user = Msg(name="user", role="user", content="hi")

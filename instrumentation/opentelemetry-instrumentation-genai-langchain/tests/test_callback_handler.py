@@ -8,19 +8,43 @@ All TelemetryHandler interactions are mocked so that these tests exercise only
 the callback-handler logic and the invocation-manager bookkeeping.
 """
 
+import base64
+import math
 import uuid
 from unittest import mock
 
 import pytest
 from langchain_core.documents import Document
-from langchain_core.messages import AIMessage, HumanMessage
-from langchain_core.outputs import ChatGeneration, LLMResult
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    ChatMessage,
+    ChatMessageChunk,
+    FunctionMessage,
+    FunctionMessageChunk,
+    HumanMessage,
+    HumanMessageChunk,
+    RemoveMessage,
+    SystemMessage,
+    SystemMessageChunk,
+    ToolMessage,
+    ToolMessageChunk,
+)
+from langchain_core.outputs import (
+    ChatGeneration,
+    ChatGenerationChunk,
+    LLMResult,
+)
 
 from opentelemetry.instrumentation.genai.langchain.callback_handler import (
     OpenTelemetryLangChainCallbackHandler,
+    _document_to_retrieval_document,
+    _extract_document_score,
 )
 from opentelemetry.instrumentation.genai.langchain.utils import (
     _legacy_function_call_request,
+    _media_part,
+    _normalize_role,
     extract_token_details,
     make_input_message,
     make_last_output_message,
@@ -30,16 +54,20 @@ from opentelemetry.instrumentation.genai.langchain.utils import (
     to_output_messages,
 )
 from opentelemetry.util.genai.invocation import (
-    AgentInvocation,
     InferenceInvocation,
+    LocalAgentInvocation,
     RetrievalInvocation,
     WorkflowInvocation,
 )
 from opentelemetry.util.genai.types import (
+    BlobPart,
+    FilePart,
     InputMessage,
     OutputMessage,
-    Text,
-    ToolCallRequest,
+    RetrievalDocument,
+    TextPart,
+    ToolCallRequestPart,
+    UriPart,
 )
 
 # ---------------------------------------------------------------------------
@@ -48,31 +76,14 @@ from opentelemetry.util.genai.types import (
 
 
 def _make_agent_inv_mock() -> mock.MagicMock:
-    """Return a spec'd AgentInvocation mock with agent_name pre-configured."""
-    agent_inv = mock.MagicMock(spec=AgentInvocation)
-    agent_inv.span = mock.MagicMock()
-    agent_inv.span.is_recording.return_value = False
-    # agent_name is an instance attribute set in AgentInvocation.__init__ via the
-    # constructor arg; pre-configure it so spec-restricted attribute access works.
-    agent_inv.agent_name = None
+    """Return a spec'd LocalAgentInvocation mock."""
+    agent_inv = mock.MagicMock(spec=LocalAgentInvocation)
+    agent_inv.agent_id = None
     return agent_inv
-
-
-def _make_invoke_local_agent_side_effect(inv: mock.MagicMock):
-    """Return a side_effect for invoke_local_agent that mirrors what the real
-    AgentInvocation constructor does: set agent_name from the kwarg."""
-
-    def _side_effect(*args, **kwargs):
-        inv.agent_name = kwargs.get("agent_name")
-        return inv
-
-    return _side_effect
 
 
 def _make_retrieval_inv_mock() -> mock.MagicMock:
     retrieval_inv = mock.MagicMock(spec=RetrievalInvocation)
-    retrieval_inv.span = mock.MagicMock()
-    retrieval_inv.span.is_recording.return_value = False
     retrieval_inv.query_text = None
     retrieval_inv.documents = None
     return retrieval_inv
@@ -84,16 +95,10 @@ def _make_handler():
 
     # workflow returns a mock WorkflowInvocation
     workflow_inv = mock.MagicMock(spec=WorkflowInvocation)
-    workflow_inv.span = mock.MagicMock()
-    workflow_inv.span.is_recording.return_value = False
     telemetry.workflow.return_value = workflow_inv
 
-    # invoke_local_agent returns a mock AgentInvocation whose agent_name is set
-    # to match whatever agent_name kwarg was passed (mirrors real constructor).
     agent_inv = _make_agent_inv_mock()
-    telemetry.invoke_local_agent.side_effect = (
-        _make_invoke_local_agent_side_effect(agent_inv)
-    )
+    telemetry.invoke_local_agent.return_value = agent_inv
 
     handler = OpenTelemetryLangChainCallbackHandler(telemetry)
     return handler, telemetry, workflow_inv, agent_inv
@@ -145,7 +150,12 @@ class TestOnChainStartWorkflow:
             parent_run_id=None,
         )
 
-        telemetry.workflow.assert_called_once_with(name="MyLangGraph")
+        telemetry.workflow.assert_called_once_with(
+            name="MyLangGraph",
+            context=None,
+            conversation_id=None,
+            _attach_to_context=True,
+        )
 
     def test_workflow_name_overridden_by_metadata(self):
         handler, telemetry, _, _ = _make_handler()
@@ -159,7 +169,26 @@ class TestOnChainStartWorkflow:
             metadata={"workflow_name": "custom_workflow"},
         )
 
-        telemetry.workflow.assert_called_once_with(name="custom_workflow")
+        telemetry.workflow.assert_called_once_with(
+            name="custom_workflow",
+            context=None,
+            conversation_id=None,
+            _attach_to_context=True,
+        )
+
+    def test_workflow_conversation_id_from_metadata(self):
+        handler, telemetry, _, _ = _make_handler()
+        run_id = _run_id()
+
+        handler.on_chain_start(
+            serialized={"name": "MyLangGraph"},
+            inputs={},
+            run_id=run_id,
+            parent_run_id=None,
+            metadata={"thread_id": "t1"},
+        )
+
+        assert telemetry.workflow.call_args.kwargs["conversation_id"] == "t1"
 
     def test_workflow_registered_in_invocation_manager(self):
         handler, _, workflow_inv, _ = _make_handler()
@@ -174,6 +203,34 @@ class TestOnChainStartWorkflow:
 
         assert (
             handler._invocation_manager.get_invocation(run_id) is workflow_inv
+        )
+
+    def test_child_agent_passes_parent_context_to_telemetry_handler(self):
+        handler, telemetry, workflow_inv, _ = _make_handler()
+        parent_id = _run_id()
+        child_id = _run_id()
+
+        handler.on_chain_start(
+            serialized={"name": "LangGraph"},
+            inputs={},
+            run_id=parent_id,
+            parent_run_id=None,
+        )
+        telemetry.invoke_local_agent.reset_mock()
+
+        handler.on_chain_start(
+            serialized={"name": "math_agent"},
+            inputs={},
+            run_id=child_id,
+            parent_run_id=parent_id,
+            metadata={"agent_name": "math_agent"},
+        )
+
+        telemetry.invoke_local_agent.assert_called_once_with(
+            agent_name="math_agent",
+            context=workflow_inv.context,
+            conversation_id=None,
+            _attach_to_context=True,
         )
 
 
@@ -197,12 +254,46 @@ class TestOnChainStartAgent:
 
         telemetry.invoke_local_agent.assert_called_once_with(
             agent_name="math_agent",
+            context=None,
+            conversation_id=None,
+            _attach_to_context=True,
         )
-        assert agent_inv.agent_name == "math_agent"
+        assert (
+            handler._invocation_manager.get_agent_name(run_id) == "math_agent"
+        )
         assert handler._invocation_manager.get_invocation(run_id) is agent_inv
 
+    def test_agent_name_heuristic_sets_standard_agent_attributes(self):
+        handler, telemetry, _, agent_inv = _make_handler()
+        telemetry.should_capture_content.return_value = True
+        run_id = _run_id()
+
+        handler.on_chain_start(
+            serialized={},
+            inputs={"messages": [HumanMessage(content="Solve this")]},
+            run_id=run_id,
+            parent_run_id=None,
+            metadata={"thread_id": "thread-abc"},
+            name="AgentExecutor",
+        )
+        handler.on_chain_end(
+            outputs={"messages": [AIMessage(content="Solved")]},
+            run_id=run_id,
+        )
+
+        telemetry.workflow.assert_not_called()
+        telemetry.invoke_local_agent.assert_called_once_with(
+            agent_name="AgentExecutor",
+            context=None,
+            conversation_id="thread-abc",
+            _attach_to_context=True,
+        )
+        assert agent_inv.input_messages[0].parts[0].content == "Solve this"
+        assert agent_inv.output_messages[0].parts[0].content == "Solved"
+        agent_inv.stop.assert_called_once_with()
+
     def test_agent_metadata_set(self):
-        handler, _, _, agent_inv = _make_handler()
+        handler, telemetry, _, agent_inv = _make_handler()
         run_id = _run_id()
 
         handler.on_chain_start(
@@ -218,12 +309,15 @@ class TestOnChainStartAgent:
             },
         )
 
-        assert agent_inv.agent_id == "agent-123"
+        assert agent_inv.agent_id is None
         assert agent_inv.agent_description == "does math"
-        assert agent_inv.conversation_id == "thread-abc"
+        assert (
+            telemetry.invoke_local_agent.call_args.kwargs["conversation_id"]
+            == "thread-abc"
+        )
 
     def test_conversation_id_prefers_thread_id_over_session_id(self):
-        handler, _, _, agent_inv = _make_handler()
+        handler, telemetry, _, _ = _make_handler()
         run_id = _run_id()
 
         handler.on_chain_start(
@@ -238,7 +332,32 @@ class TestOnChainStartAgent:
             },
         )
 
-        assert agent_inv.conversation_id == "t1"
+        assert (
+            telemetry.invoke_local_agent.call_args.kwargs["conversation_id"]
+            == "t1"
+        )
+
+    def test_conversation_id_prefers_session_id_over_conversation_id(self):
+        """thread_id > session_id > conversation_id is the resolution order."""
+        handler, telemetry, _, _ = _make_handler()
+        run_id = _run_id()
+
+        handler.on_chain_start(
+            serialized={"name": "math_agent"},
+            inputs={},
+            run_id=run_id,
+            parent_run_id=None,
+            metadata={
+                "agent_name": "math_agent",
+                "conversation_id": "c1",
+                "session_id": "s1",
+            },
+        )
+
+        assert (
+            telemetry.invoke_local_agent.call_args.kwargs["conversation_id"]
+            == "s1"
+        )
 
     def test_duplicate_agent_name_does_not_create_new_span(self):
         """When the nearest ancestor already has the same agent name, no new
@@ -277,9 +396,11 @@ class TestOnChainStartAgent:
 
         # First agent
         first_agent_inv = _make_agent_inv_mock()
-        telemetry.invoke_local_agent.side_effect = (
-            _make_invoke_local_agent_side_effect(first_agent_inv)
-        )
+        second_agent_inv = _make_agent_inv_mock()
+        telemetry.invoke_local_agent.side_effect = [
+            first_agent_inv,
+            second_agent_inv,
+        ]
 
         handler.on_chain_start(
             serialized={"name": "math_agent"},
@@ -287,12 +408,6 @@ class TestOnChainStartAgent:
             run_id=parent_run_id,
             parent_run_id=None,
             metadata={"agent_name": "math_agent"},
-        )
-
-        # Second agent with a different name
-        second_agent_inv = _make_agent_inv_mock()
-        telemetry.invoke_local_agent.side_effect = (
-            _make_invoke_local_agent_side_effect(second_agent_inv)
         )
 
         handler.on_chain_start(
@@ -307,7 +422,10 @@ class TestOnChainStartAgent:
             handler._invocation_manager.get_invocation(child_run_id)
             is second_agent_inv
         )
-        assert second_agent_inv.agent_name == "weather_agent"
+        assert (
+            handler._invocation_manager.get_agent_name(child_run_id)
+            == "weather_agent"
+        )
 
     def test_agent_name_comparison_is_case_insensitive(self):
         handler, telemetry, _, _ = _make_handler()
@@ -315,9 +433,7 @@ class TestOnChainStartAgent:
         child_run_id = _run_id()
 
         parent_agent_inv = _make_agent_inv_mock()
-        telemetry.invoke_local_agent.side_effect = (
-            _make_invoke_local_agent_side_effect(parent_agent_inv)
-        )
+        telemetry.invoke_local_agent.return_value = parent_agent_inv
 
         handler.on_chain_start(
             serialized={"name": "Math_Agent"},
@@ -361,12 +477,13 @@ class TestOnChainStartAgent:
         assert run_id in handler._invocation_manager._invocations
         assert handler._invocation_manager.get_invocation(run_id) is None
 
-    def test_no_agent_name_child_can_still_find_ancestor_agent(self):
+    def test_same_name_grandchild_finds_agent_through_unnamed_parent(self):
         """Even when an intermediate node has no agent name, a deeper child
         must still be able to walk up and find a grandparent AgentInvocation."""
-        handler, telemetry, _, agent_inv = _make_handler()
+        handler, telemetry, _, _ = _make_handler()
         grandparent_id = _run_id()
         parent_id = _run_id()
+        child_id = _run_id()
 
         # Grandparent: a known agent
         handler.on_chain_start(
@@ -387,14 +504,81 @@ class TestOnChainStartAgent:
             metadata={"otel_agent_span": True},
         )
 
-        # Child: should find the grandparent agent via _find_nearest_agent
-        found = handler._find_nearest_agent(parent_id)
-        assert found is agent_inv
+        # A same-name grandchild must deduplicate against the grandparent agent.
+        handler.on_chain_start(
+            serialized={"name": "math_agent"},
+            inputs={},
+            run_id=child_id,
+            parent_run_id=parent_id,
+            metadata={"agent_name": "math_agent"},
+        )
+
+        telemetry.invoke_local_agent.assert_not_called()
+        assert handler._invocation_manager.get_invocation(child_id) is None
 
 
 # ---------------------------------------------------------------------------
 # on_chain_start – unclassified
 # ---------------------------------------------------------------------------
+
+
+class TestOnChatModelStartConversationId:
+    def test_conversation_id_from_metadata(self):
+        handler, telemetry, _, _ = _make_handler()
+        run_id = _run_id()
+
+        handler.on_chat_model_start(
+            serialized={"name": "ChatOpenAI"},
+            messages=[[HumanMessage(content="What is 3 * 4?")]],
+            run_id=run_id,
+            parent_run_id=None,
+            metadata={"ls_provider": "openai", "thread_id": "t1"},
+            invocation_params={"model_name": "gpt-4"},
+        )
+
+        assert telemetry.inference.call_args.kwargs["conversation_id"] == "t1"
+
+    def test_no_conversation_id_available(self):
+        handler, telemetry, _, _ = _make_handler()
+        run_id = _run_id()
+
+        handler.on_chat_model_start(
+            serialized={"name": "ChatOpenAI"},
+            messages=[[HumanMessage(content="What is 3 * 4?")]],
+            run_id=run_id,
+            parent_run_id=None,
+            metadata={"ls_provider": "openai"},
+            invocation_params={"model_name": "gpt-4"},
+        )
+
+        assert telemetry.inference.call_args.kwargs["conversation_id"] is None
+
+    def test_chat_model_passes_parent_context_to_telemetry_handler(self):
+        handler, telemetry, _, _ = _make_handler()
+        parent_id = _run_id()
+        child_id = _run_id()
+
+        parent_wf = mock.MagicMock(spec=WorkflowInvocation)
+        handler._invocation_manager.add_invocation_state(
+            parent_id, None, parent_wf
+        )
+
+        handler.on_chat_model_start(
+            serialized={"name": "ChatOpenAI"},
+            messages=[[HumanMessage(content="What is 3 * 4?")]],
+            run_id=child_id,
+            parent_run_id=parent_id,
+            metadata={"ls_provider": "openai"},
+            invocation_params={"model_name": "gpt-4"},
+        )
+
+        telemetry.inference.assert_called_once_with(
+            "openai",
+            request_model="gpt-4",
+            context=parent_wf.context,
+            conversation_id=None,
+            _attach_to_context=True,
+        )
 
 
 class TestOnChainStartUnclassified:
@@ -484,8 +668,6 @@ class TestOnChainEnd:
             parent_run_id=None,
         )
 
-        # span.is_recording() returns False → should be cleaned up
-        workflow_inv.span.is_recording.return_value = False
         handler.on_chain_end(outputs={}, run_id=run_id)
 
         assert run_id not in handler._invocation_manager._invocations
@@ -553,74 +735,38 @@ class TestOnChainError:
             parent_run_id=None,
         )
 
-        workflow_inv.span.is_recording.return_value = False
         handler.on_chain_error(error=RuntimeError("boom"), run_id=run_id)
 
         assert run_id not in handler._invocation_manager._invocations
 
 
-# ---------------------------------------------------------------------------
-# _find_nearest_agent
-# ---------------------------------------------------------------------------
-
-
-class TestFindNearestAgent:
-    def test_returns_none_when_no_agent_in_ancestry(self):
-        handler, _, workflow_inv, _ = _make_handler()
-        run_id = _run_id()
+class TestAgentAncestryPublicBehavior:
+    def test_named_child_under_workflow_opens_agent_layer(self):
+        handler, telemetry, workflow_inv, _ = _make_handler()
+        workflow_id = _run_id()
+        child_id = _run_id()
 
         handler.on_chain_start(
             serialized={"name": "LangGraph"},
             inputs={},
-            run_id=run_id,
+            run_id=workflow_id,
             parent_run_id=None,
         )
-
-        assert handler._find_nearest_agent(run_id) is None
-
-    def test_finds_direct_parent_agent(self):
-        handler, telemetry, _, agent_inv = _make_handler()
-        parent_id = _run_id()
-        child_id = _run_id()
-
+        telemetry.invoke_local_agent.reset_mock()
         handler.on_chain_start(
             serialized={"name": "math_agent"},
             inputs={},
-            run_id=parent_id,
-            parent_run_id=None,
+            run_id=child_id,
+            parent_run_id=workflow_id,
             metadata={"agent_name": "math_agent"},
         )
 
-        # Register the child as unclassified so it links to the parent
-        handler._invocation_manager.add_invocation_state(
-            child_id, parent_id, None
+        telemetry.invoke_local_agent.assert_called_once_with(
+            agent_name="math_agent",
+            context=workflow_inv.context,
+            conversation_id=None,
+            _attach_to_context=True,
         )
-
-        found = handler._find_nearest_agent(child_id)
-        assert found is agent_inv
-
-    def test_finds_grandparent_agent(self):
-        handler, telemetry, _, agent_inv = _make_handler()
-        grandparent_id = _run_id()
-        parent_id = _run_id()
-        child_id = _run_id()
-
-        handler.on_chain_start(
-            serialized={"name": "math_agent"},
-            inputs={},
-            run_id=grandparent_id,
-            parent_run_id=None,
-            metadata={"agent_name": "math_agent"},
-        )
-        handler._invocation_manager.add_invocation_state(
-            parent_id, grandparent_id, None
-        )
-        handler._invocation_manager.add_invocation_state(
-            child_id, parent_id, None
-        )
-
-        found = handler._find_nearest_agent(child_id)
-        assert found is agent_inv
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +791,7 @@ class TestMakeInputMessage:
         assert isinstance(result[0], InputMessage)
         assert result[0].role == "user"
         assert len(result[0].parts) == 1
-        assert isinstance(result[0].parts[0], Text)
+        assert isinstance(result[0].parts[0], TextPart)
         assert result[0].parts[0].content == "Hello"
 
     def test_messages_key_skips_empty_content(self):
@@ -1145,10 +1291,7 @@ class TestOutputMessagesOnInvocations:
 
 
 def _make_llm_invocation_mock() -> mock.MagicMock:
-    inv = mock.MagicMock(spec=InferenceInvocation)
-    inv.span = mock.MagicMock()
-    inv.span.is_recording.return_value = False
-    return inv
+    return mock.MagicMock(spec=InferenceInvocation)
 
 
 def _make_handler_with_llm_invocation(
@@ -1168,7 +1311,7 @@ def _make_handler_with_llm_invocation(
 
 class TestOnLlmEndToolCalls:
     def test_openai_tool_calls_finish_reason_produces_tool_call_request(self):
-        """finish_reason='tool_calls' (OpenAI) must produce ToolCallRequest parts."""
+        """finish_reason='tool_calls' (OpenAI) must produce ToolCallRequestPart parts."""
         run_id = _run_id()
         handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
 
@@ -1190,15 +1333,16 @@ class TestOnLlmEndToolCalls:
         assigned: list[OutputMessage] = llm_inv.output_messages
         assert len(assigned) == 1
         assert assigned[0].finish_reason == "tool_calls"
+        assert llm_inv.finish_reasons == ["tool_calls"]
         assert len(assigned[0].parts) == 1
         part = assigned[0].parts[0]
-        assert isinstance(part, ToolCallRequest)
+        assert isinstance(part, ToolCallRequestPart)
         assert part.name == "get_weather"
         assert part.id == "call_123"
         assert part.arguments == {"location": "Paris"}
 
     def test_bedrock_tool_use_finish_reason_produces_tool_call_request(self):
-        """finish_reason='tool_use' (Bedrock/Anthropic) must produce ToolCallRequest parts."""
+        """finish_reason='tool_use' (Bedrock/Anthropic) must produce ToolCallRequestPart parts."""
         run_id = _run_id()
         handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
 
@@ -1221,12 +1365,244 @@ class TestOnLlmEndToolCalls:
         assigned: list[OutputMessage] = llm_inv.output_messages
         assert len(assigned) == 1
         assert assigned[0].finish_reason == "tool_use"
+        assert llm_inv.finish_reasons == ["tool_use"]
         assert len(assigned[0].parts) == 1
         part = assigned[0].parts[0]
-        assert isinstance(part, ToolCallRequest)
+        assert isinstance(part, ToolCallRequestPart)
         assert part.name == "get_weather"
         assert part.id == "tooluse_abc"
         assert part.arguments == {"location": "London"}
+
+    def test_on_llm_end_preserves_finish_reasons_positional_alignment(self):
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+        gen1 = ChatGeneration(
+            message=AIMessage(content="First"),
+            generation_info={"finish_reason": "stop"},
+        )
+        gen2 = ChatGeneration(
+            message=AIMessage(
+                content="Second",
+                response_metadata={"model_name": "gpt-4"},
+            ),
+            generation_info=None,
+        )
+        gen3 = ChatGeneration(
+            message=AIMessage(content="Third"),
+            generation_info={},
+        )
+        gen4 = ChatGeneration(
+            message=AIMessage(content="Fourth"),
+            generation_info={"finish_reason": "length"},
+        )
+        response = LLMResult(generations=[[gen1, gen2, gen3, gen4]])
+
+        handler.on_llm_end(response=response, run_id=run_id)
+
+        assert llm_inv.finish_reasons == ["stop", "error", "error", "length"]
+        assert [m.finish_reason for m in llm_inv.output_messages] == [
+            "stop",
+            "error",
+            "error",
+            "length",
+        ]
+
+    def test_on_llm_end_preserves_message_name(self):
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+        ai_msg = AIMessage(content="Hello!", name="assistant_bot")
+        gen = ChatGeneration(
+            message=ai_msg, generation_info={"finish_reason": "stop"}
+        )
+        response = LLMResult(generations=[[gen]])
+
+        handler.on_llm_end(response=response, run_id=run_id)
+
+        assigned: list[OutputMessage] = llm_inv.output_messages
+        assert len(assigned) == 1
+        assert assigned[0].name == "assistant_bot"
+
+    def test_on_llm_end_tool_calls_preserves_message_name(self):
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+        tool_call = {
+            "name": "get_weather",
+            "id": "call_123",
+            "args": {"location": "Paris"},
+        }
+        ai_msg = AIMessage(
+            content="",
+            tool_calls=[tool_call],
+            name="tool_caller_bot",
+            response_metadata={},
+        )
+        gen = ChatGeneration(
+            message=ai_msg, generation_info={"finish_reason": "tool_calls"}
+        )
+        response = LLMResult(generations=[[gen]])
+
+        handler.on_llm_end(response=response, run_id=run_id)
+
+        assigned: list[OutputMessage] = llm_inv.output_messages
+        assert len(assigned) == 1
+        assert assigned[0].name == "tool_caller_bot"
+
+    def test_ollama_done_reason_preserves_tool_calls(self):
+        """ChatOllama reports its stop reason as `done_reason` and sets no
+        `finish_reason`/`stop_reason`. The tool-call parts must still be
+        recorded rather than dropped because the finish reason resolves to
+        `"error"`.
+        """
+        run_id = _run_id()
+        handler, telemetry, llm_inv = _make_handler_with_llm_invocation(run_id)
+        telemetry.should_capture_content.return_value = True
+
+        tool_call = {
+            "name": "get_weather",
+            "id": "call_ollama_1",
+            "args": {"city": "Seattle"},
+        }
+        # ChatOllama publishes the stop reason under `done_reason` only.
+        ai_msg = AIMessage(
+            content="", tool_calls=[tool_call], response_metadata={}
+        )
+        gen = ChatGeneration(
+            message=ai_msg, generation_info={"done_reason": "stop"}
+        )
+        response = LLMResult(generations=[[gen]])
+
+        handler.on_llm_end(response=response, run_id=run_id)
+
+        assigned: list[OutputMessage] = llm_inv.output_messages
+        assert len(assigned) == 1
+        assert len(assigned[0].parts) == 1
+        part = assigned[0].parts[0]
+        assert isinstance(part, ToolCallRequestPart)
+        assert part.name == "get_weather"
+        assert part.id == "call_ollama_1"
+        assert part.arguments == {"city": "Seattle"}
+        # done_reason must resolve finish_reason to "stop", not "error".
+        assert assigned[0].finish_reason == "stop"
+        assert llm_inv.finish_reasons == ["stop"]
+
+    def test_response_with_both_text_and_tool_calls_preserves_both(self):
+        """A response carrying both assistant text and tool calls must
+        keep both: gating only on tool calls previously dropped the text.
+        """
+        run_id = _run_id()
+        handler, telemetry, llm_inv = _make_handler_with_llm_invocation(run_id)
+        telemetry.should_capture_content.return_value = True
+
+        tool_call = {
+            "name": "get_weather",
+            "id": "call_1",
+            "args": {"city": "Seattle"},
+        }
+        ai_msg = AIMessage(
+            content="Checking the weather...",
+            tool_calls=[tool_call],
+            response_metadata={},
+        )
+        gen = ChatGeneration(
+            message=ai_msg, generation_info={"finish_reason": "tool_calls"}
+        )
+        response = LLMResult(generations=[[gen]])
+
+        handler.on_llm_end(response=response, run_id=run_id)
+
+        assigned: list[OutputMessage] = llm_inv.output_messages
+        assert len(assigned) == 1
+        assert len(assigned[0].parts) == 2
+        assert isinstance(assigned[0].parts[0], TextPart)
+        assert assigned[0].parts[0].content == "Checking the weather..."
+        assert isinstance(assigned[0].parts[1], ToolCallRequestPart)
+        assert assigned[0].parts[1].name == "get_weather"
+
+    def test_content_capture_disabled_skips_output_message_but_keeps_finish_reason(
+        self,
+    ):
+        """With content capture off, no output message is built (so an
+        image payload is never decoded), but finish reasons are still
+        recorded."""
+        run_id = _run_id()
+        handler, telemetry, llm_inv = _make_handler_with_llm_invocation(run_id)
+        telemetry.should_capture_content.return_value = False
+
+        ai_msg = AIMessage(
+            content="Checking the weather...",
+            tool_calls=[
+                {"name": "get_weather", "id": "c1", "args": {"city": "X"}}
+            ],
+            response_metadata={},
+        )
+        gen = ChatGeneration(
+            message=ai_msg, generation_info={"finish_reason": "tool_calls"}
+        )
+        response = LLMResult(generations=[[gen]])
+
+        handler.on_llm_end(response=response, run_id=run_id)
+
+        # No output message recorded when capture is disabled ...
+        assert llm_inv.output_messages == []
+        # ... but the finish reason is still collected.
+        assert llm_inv.finish_reasons == ["tool_calls"]
+
+    def test_no_tool_calls_still_records_text(self):
+        """A response with no tool calls keeps recording its text content,
+        independent of the finish-reason spelling.
+        """
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+        ai_msg = AIMessage(content="Sunny, 18C", response_metadata={})
+        gen = ChatGeneration(
+            message=ai_msg, generation_info={"done_reason": "stop"}
+        )
+        response = LLMResult(generations=[[gen]])
+
+        handler.on_llm_end(response=response, run_id=run_id)
+
+        assigned: list[OutputMessage] = llm_inv.output_messages
+        assert len(assigned) == 1
+        assert len(assigned[0].parts) == 1
+        part = assigned[0].parts[0]
+        assert isinstance(part, TextPart)
+        assert part.content == "Sunny, 18C"
+
+
+# ---------------------------------------------------------------------------
+# on_tool_start
+# ---------------------------------------------------------------------------
+
+
+class TestOnToolStart:
+    def test_tool_passes_parent_context_to_telemetry_handler(self):
+        handler, telemetry, _, _ = _make_handler()
+        parent_id = _run_id()
+        child_id = _run_id()
+
+        parent_wf = mock.MagicMock(spec=WorkflowInvocation)
+        handler._invocation_manager.add_invocation_state(
+            parent_id, None, parent_wf
+        )
+
+        handler.on_tool_start(
+            serialized={"name": "search"},
+            input_str="query",
+            run_id=child_id,
+            parent_run_id=parent_id,
+        )
+
+        telemetry.tool.assert_called_once_with(
+            name="search",
+            tool_type="function",
+            agent_name=None,
+            context=parent_wf.context,
+            _attach_to_context=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1249,6 +1625,20 @@ class TestOnRetrieverStart:
         assert (
             handler._invocation_manager.get_invocation(run_id) is retrieval_inv
         )
+
+    def test_conversation_id_not_passed_to_invocation(self):
+        """semconv does not define gen_ai.conversation.id for retrieval."""
+        handler, telemetry, _ = _make_handler_with_retrieval()
+        run_id = _run_id()
+
+        handler.on_retriever_start(
+            serialized={},
+            query="what is AI?",
+            run_id=run_id,
+            metadata={"thread_id": "t1"},
+        )
+
+        assert "conversation_id" not in telemetry.retrieval.call_args.kwargs
 
     def test_query_text_set_on_invocation(self):
         handler, _, retrieval_inv = _make_handler_with_retrieval()
@@ -1274,7 +1664,10 @@ class TestOnRetrieverStart:
         )
 
         telemetry.retrieval.assert_called_once_with(
-            provider="Chroma", request_model=None
+            provider="Chroma",
+            request_model=None,
+            context=None,
+            _attach_to_context=True,
         )
 
     def test_provider_none_when_metadata_absent(self):
@@ -1288,7 +1681,10 @@ class TestOnRetrieverStart:
         )
 
         telemetry.retrieval.assert_called_once_with(
-            provider=None, request_model=None
+            provider=None,
+            request_model=None,
+            context=None,
+            _attach_to_context=True,
         )
 
     def test_request_model_passed_from_ls_embedding_model(self):
@@ -1306,7 +1702,10 @@ class TestOnRetrieverStart:
         )
 
         telemetry.retrieval.assert_called_once_with(
-            provider="Chroma", request_model="text-embedding-3-small"
+            provider="Chroma",
+            request_model="text-embedding-3-small",
+            context=None,
+            _attach_to_context=True,
         )
 
     def test_request_model_none_when_ls_embedding_model_absent(self):
@@ -1321,7 +1720,10 @@ class TestOnRetrieverStart:
         )
 
         telemetry.retrieval.assert_called_once_with(
-            provider="Chroma", request_model=None
+            provider="Chroma",
+            request_model=None,
+            context=None,
+            _attach_to_context=True,
         )
 
     def test_registered_in_invocation_manager(self):
@@ -1339,6 +1741,31 @@ class TestOnRetrieverStart:
             handler._invocation_manager.get_invocation(run_id) is retrieval_inv
         )
 
+    def test_retriever_passes_parent_context_to_telemetry_handler(self):
+        handler, telemetry, retrieval_inv = _make_handler_with_retrieval()
+        parent_id = _run_id()
+        child_id = _run_id()
+
+        # register parent workflow in invocation manager
+        parent_wf = mock.MagicMock(spec=WorkflowInvocation)
+        handler._invocation_manager.add_invocation_state(
+            parent_id, None, parent_wf
+        )
+
+        handler.on_retriever_start(
+            serialized={},
+            query="q",
+            run_id=child_id,
+            parent_run_id=parent_id,
+        )
+
+        telemetry.retrieval.assert_called_once_with(
+            provider=None,
+            request_model=None,
+            context=parent_wf.context,
+            _attach_to_context=True,
+        )
+
 
 class TestOnRetrieverEnd:
     def test_invocation_stopped(self):
@@ -1350,7 +1777,7 @@ class TestOnRetrieverEnd:
 
         retrieval_inv.stop.assert_called_once()
 
-    def test_documents_set_from_page_content(self):
+    def test_documents_use_shared_model_without_content(self):
         handler, _, retrieval_inv = _make_handler_with_retrieval()
         run_id = _run_id()
 
@@ -1363,10 +1790,8 @@ class TestOnRetrieverEnd:
         handler.on_retriever_end(documents=docs, run_id=run_id)
 
         assigned = retrieval_inv.documents
-        assert len(assigned) == 2
-        assert assigned[0]["content"] == "doc one"
-        assert "source" not in assigned[0]
-        assert assigned[1]["content"] == "doc two"
+        assert assigned == [RetrievalDocument(), RetrievalDocument()]
+        assert all(isinstance(doc, RetrievalDocument) for doc in assigned)
 
     def test_document_id_included_when_present(self):
         handler, _, retrieval_inv = _make_handler_with_retrieval()
@@ -1377,7 +1802,7 @@ class TestOnRetrieverEnd:
         handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
         handler.on_retriever_end(documents=[doc], run_id=run_id)
 
-        assert retrieval_inv.documents[0]["id"] == "doc-123"
+        assert retrieval_inv.documents[0].id == "doc-123"
 
     def test_document_id_none_when_absent(self):
         handler, _, retrieval_inv = _make_handler_with_retrieval()
@@ -1388,14 +1813,13 @@ class TestOnRetrieverEnd:
         handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
         handler.on_retriever_end(documents=[doc], run_id=run_id)
 
-        assert retrieval_inv.documents[0]["id"] is None
+        assert retrieval_inv.documents[0].id is None
 
     def test_state_cleaned_up_after_end(self):
         handler, _, retrieval_inv = _make_handler_with_retrieval()
         run_id = _run_id()
 
         handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
-        retrieval_inv.span.is_recording.return_value = False
         handler.on_retriever_end(documents=[], run_id=run_id)
 
         assert run_id not in handler._invocation_manager._invocations
@@ -1420,11 +1844,443 @@ class TestOnRetrieverEnd:
         handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
         handler.on_retriever_end(documents=docs, run_id=run_id)
 
-        assert retrieval_inv.documents[0]["content"] == "visible"
+        assert retrieval_inv.documents == [RetrievalDocument()]
 
     def test_unknown_run_id_does_not_raise(self):
         handler, _, _ = _make_handler_with_retrieval()
         handler.on_retriever_end(documents=[], run_id=_run_id())
+
+    def test_document_score_from_attribute(self):
+        handler, _, retrieval_inv = _make_handler_with_retrieval()
+        run_id = _run_id()
+
+        class DuckDoc:
+            page_content = "text"
+            id = "doc-1"
+            score = 0.85
+            metadata = {}
+
+        handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
+        handler.on_retriever_end(documents=[DuckDoc()], run_id=run_id)
+
+        assert retrieval_inv.documents[0].score == 0.85
+
+    def test_document_score_from_metadata(self):
+        handler, _, retrieval_inv = _make_handler_with_retrieval()
+        run_id = _run_id()
+
+        doc = Document(
+            page_content="text", id="doc-2", metadata={"score": 0.92}
+        )
+
+        handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
+        handler.on_retriever_end(documents=[doc], run_id=run_id)
+
+        assert retrieval_inv.documents[0].score == 0.92
+
+    def test_document_score_precedence(self):
+        handler, _, retrieval_inv = _make_handler_with_retrieval()
+        run_id = _run_id()
+
+        class DuckDoc:
+            page_content = "text"
+            id = "doc-3"
+            score = 0.9
+            metadata = {"score": 0.5}
+
+        handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
+        handler.on_retriever_end(documents=[DuckDoc()], run_id=run_id)
+
+        assert retrieval_inv.documents[0].score == 0.9
+
+    def test_document_score_fallback_to_metadata_when_attr_is_none(self):
+        handler, _, retrieval_inv = _make_handler_with_retrieval()
+        run_id = _run_id()
+
+        class DuckDoc:
+            page_content = "text"
+            id = "doc-4"
+            score = None
+            metadata = {"score": 0.77}
+
+        handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
+        handler.on_retriever_end(documents=[DuckDoc()], run_id=run_id)
+
+        assert retrieval_inv.documents[0].score == 0.77
+
+    def test_document_score_zero_preserved(self):
+        handler, _, retrieval_inv = _make_handler_with_retrieval()
+        run_id = _run_id()
+
+        class DuckDoc:
+            page_content = "text"
+            id = "doc-5"
+            score = 0.0
+
+        doc_meta = Document(
+            page_content="text-meta", id="doc-6", metadata={"score": 0}
+        )
+
+        handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
+        handler.on_retriever_end(
+            documents=[DuckDoc(), doc_meta], run_id=run_id
+        )
+
+        assert retrieval_inv.documents[0].score == 0.0
+        assert retrieval_inv.documents[1].score == 0
+
+    @pytest.mark.parametrize(
+        "invalid_score",
+        ["high", True, False, [1.0], {"val": 1}],
+    )
+    def test_document_score_non_numeric_ignored(self, invalid_score):
+        handler, _, retrieval_inv = _make_handler_with_retrieval()
+        run_id = _run_id()
+
+        doc = Document(page_content="text", metadata={"score": invalid_score})
+
+        handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
+        handler.on_retriever_end(documents=[doc], run_id=run_id)
+
+        assert retrieval_inv.documents[0].score is None
+
+    @pytest.mark.parametrize(
+        "non_finite_score",
+        [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            math.nan,
+            math.inf,
+            -math.inf,
+        ],
+    )
+    def test_document_score_non_finite_ignored(self, non_finite_score):
+        handler, _, retrieval_inv = _make_handler_with_retrieval()
+        run_id = _run_id()
+
+        class DuckDocAttr:
+            page_content = "attr text"
+            score = non_finite_score
+
+        doc_meta = Document(
+            page_content="meta text", metadata={"score": non_finite_score}
+        )
+        doc_dict = {"page_content": "dict text", "score": non_finite_score}
+
+        handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
+        handler.on_retriever_end(
+            documents=[DuckDocAttr(), doc_meta, doc_dict], run_id=run_id
+        )
+
+        for item in retrieval_inv.documents:
+            assert item.score is None
+
+    def test_document_score_plain_dict_and_duck_typed(self):
+        handler, _, retrieval_inv = _make_handler_with_retrieval()
+        run_id = _run_id()
+
+        dict_doc_1 = {
+            "page_content": "dict content 1",
+            "id": "dict-1",
+            "score": 0.88,
+        }
+        dict_doc_2 = {
+            "content": "dict content 2",
+            "metadata": {"score": 0.72},
+        }
+        dict_doc_3 = {
+            "page_content": None,
+            "content": "dict content fallback when page_content is None",
+            "id": "dict-3",
+            "score": 0.64,
+        }
+
+        class CustomDuckDoc:
+            page_content = "duck content"
+            id = "duck-1"
+            score = 0.95
+
+        class CustomDuckDocContentFallback:
+            content = "duck content fallback"
+            id = "duck-2"
+            score = 0.81
+
+        class CustomDuckDocNonePageContentFallback:
+            page_content = None
+            content = "duck content fallback when page_content is None"
+            id = "duck-3"
+            score = 0.55
+
+        handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
+        handler.on_retriever_end(
+            documents=[
+                dict_doc_1,
+                dict_doc_2,
+                dict_doc_3,
+                CustomDuckDoc(),
+                CustomDuckDocContentFallback(),
+                CustomDuckDocNonePageContentFallback(),
+            ],
+            run_id=run_id,
+        )
+
+        assert retrieval_inv.documents == [
+            RetrievalDocument(id="dict-1", score=0.88),
+            RetrievalDocument(score=0.72),
+            RetrievalDocument(id="dict-3", score=0.64),
+            RetrievalDocument(id="duck-1", score=0.95),
+            RetrievalDocument(id="duck-2", score=0.81),
+            RetrievalDocument(id="duck-3", score=0.55),
+        ]
+
+    def test_document_score_non_mapping_metadata(self):
+        handler, _, retrieval_inv = _make_handler_with_retrieval()
+        run_id = _run_id()
+
+        class DuckDocNoMeta:
+            page_content = "text"
+            id = "doc-no-meta"
+
+        class DuckDocStringMeta:
+            page_content = "text"
+            id = "doc-str-meta"
+            metadata = "not-a-mapping"
+
+        class DuckDocNoneMeta:
+            page_content = "text"
+            id = "doc-none-meta"
+            metadata = None
+
+        handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
+        handler.on_retriever_end(
+            documents=[
+                DuckDocNoMeta(),
+                DuckDocStringMeta(),
+                DuckDocNoneMeta(),
+            ],
+            run_id=run_id,
+        )
+
+        for item in retrieval_inv.documents:
+            assert item.score is None
+
+
+class TestExtractDocumentScore:
+    def test_attribute_score(self):
+        class Obj:
+            score = 0.88
+
+        assert _extract_document_score(Obj()) == 0.88
+
+    def test_metadata_score(self):
+        class Obj:
+            metadata = {"score": 0.75}
+
+        assert _extract_document_score(Obj()) == 0.75
+
+    def test_metadata_relevance_score_fallback(self):
+        class Obj:
+            metadata = {"relevance_score": 0.82}
+
+        assert _extract_document_score(Obj()) == 0.82
+
+    def test_attr_relevance_score_fallback(self):
+        class Obj:
+            relevance_score = 0.91
+
+        assert _extract_document_score(Obj()) == 0.91
+
+    def test_precedence_score_over_relevance_score(self):
+        class Obj:
+            metadata = {"score": 0.85, "relevance_score": 0.42}
+
+        assert _extract_document_score(Obj()) == 0.85
+
+    def test_precedence_attr_over_metadata(self):
+        class Obj:
+            score = 0.9
+            metadata = {"score": 0.4}
+
+        assert _extract_document_score(Obj()) == 0.9
+
+    def test_attr_none_falls_back_to_metadata(self):
+        class Obj:
+            score = None
+            metadata = {"score": 0.65}
+
+        assert _extract_document_score(Obj()) == 0.65
+
+    def test_zero_scores(self):
+        class ObjFloat:
+            score = 0.0
+
+        class ObjInt:
+            score = 0
+
+        assert _extract_document_score(ObjFloat()) == 0.0
+        assert _extract_document_score(ObjInt()) == 0
+
+    def test_negative_score(self):
+        class Obj:
+            score = -1.25
+
+        assert _extract_document_score(Obj()) == -1.25
+
+    def test_non_numeric_and_bool(self):
+        class ObjBool:
+            score = True
+
+        class ObjStr:
+            score = "0.9"
+
+        assert _extract_document_score(ObjBool()) is None
+        assert _extract_document_score(ObjStr()) is None
+
+    def test_non_finite_float_score(self):
+        class ObjNaN:
+            score = float("nan")
+
+        class ObjInf:
+            score = float("inf")
+
+        class ObjNegInf:
+            score = float("-inf")
+
+        class ObjMathNaN:
+            score = math.nan
+
+        class ObjMathInf:
+            score = math.inf
+
+        class ObjMathNegInf:
+            score = -math.inf
+
+        assert _extract_document_score(ObjNaN()) is None
+        assert _extract_document_score(ObjInf()) is None
+        assert _extract_document_score(ObjNegInf()) is None
+        assert _extract_document_score(ObjMathNaN()) is None
+        assert _extract_document_score(ObjMathInf()) is None
+        assert _extract_document_score(ObjMathNegInf()) is None
+        assert _extract_document_score({"score": float("nan")}) is None
+        assert _extract_document_score({"score": math.nan}) is None
+        assert (
+            _extract_document_score({"metadata": {"score": float("inf")}})
+            is None
+        )
+        assert (
+            _extract_document_score({"metadata": {"score": math.inf}}) is None
+        )
+        assert (
+            _extract_document_score({"metadata": {"score": float("-inf")}})
+            is None
+        )
+        assert (
+            _extract_document_score({"metadata": {"score": -math.inf}}) is None
+        )
+
+    def test_dict_score(self):
+        assert _extract_document_score({"score": 0.82}) == 0.82
+        assert _extract_document_score({"metadata": {"score": 0.91}}) == 0.91
+        assert (
+            _extract_document_score(
+                {"score": 0.99, "metadata": {"score": 0.1}}
+            )
+            == 0.99
+        )
+
+    def test_no_score(self):
+        assert _extract_document_score(object()) is None
+        assert _extract_document_score({}) is None
+        assert _extract_document_score({"metadata": None}) is None
+        assert _extract_document_score({"metadata": "str"}) is None
+
+
+class TestDocumentToRetrievalDocument:
+    def test_document_with_id_and_score(self):
+        doc = Document(
+            page_content="doc content", id="d1", metadata={"score": 0.85}
+        )
+        assert _document_to_retrieval_document(doc) == RetrievalDocument(
+            id="d1", score=0.85
+        )
+
+    def test_duck_typed_content_is_ignored(self):
+        class DuckNoPageContent:
+            content = "fallback content"
+            id = "d2"
+            score = 0.9
+
+        assert _document_to_retrieval_document(
+            DuckNoPageContent()
+        ) == RetrievalDocument(id="d2", score=0.9)
+
+    def test_duck_typed_none_page_content_is_ignored(self):
+        class DuckNonePageContent:
+            page_content = None
+            content = "fallback content when page_content is None"
+            id = "d3"
+            score = 0.75
+
+        assert _document_to_retrieval_document(
+            DuckNonePageContent()
+        ) == RetrievalDocument(id="d3", score=0.75)
+
+    def test_mapping_content_is_ignored(self):
+        doc_map = {"content": "mapping fallback", "id": "m1", "score": 0.8}
+        assert _document_to_retrieval_document(doc_map) == RetrievalDocument(
+            id="m1", score=0.8
+        )
+
+    def test_mapping_none_page_content_is_ignored(self):
+        doc_map = {
+            "page_content": None,
+            "content": "mapping fallback when page_content is None",
+            "id": "m2",
+            "score": 0.7,
+        }
+        assert _document_to_retrieval_document(doc_map) == RetrievalDocument(
+            id="m2", score=0.7
+        )
+
+    def test_does_not_access_document_content(self) -> None:
+        class LazyDocument:
+            id = "lazy"
+            score = 0.0
+
+            @property
+            def page_content(self) -> str:
+                raise AssertionError("document content must not be read")
+
+            @property
+            def content(self) -> str:
+                raise AssertionError("document content must not be read")
+
+        assert _document_to_retrieval_document(
+            LazyDocument()
+        ) == RetrievalDocument(id="lazy", score=0.0)
+
+    @pytest.mark.parametrize(
+        "doc_id", [None, 42, True, ["doc"], {"id": "doc"}]
+    )
+    def test_non_string_ids_are_not_recorded(self, doc_id: object) -> None:
+        assert (
+            _document_to_retrieval_document({"id": doc_id})
+            == RetrievalDocument()
+        )
+
+    def test_non_finite_scores_omitted(self):
+        doc_nan = Document(page_content="c", metadata={"score": math.nan})
+        doc_inf = Document(page_content="c", metadata={"score": float("inf")})
+        doc_neginf = Document(
+            page_content="c", metadata={"score": float("-inf")}
+        )
+
+        assert _document_to_retrieval_document(doc_nan) == RetrievalDocument()
+        assert _document_to_retrieval_document(doc_inf) == RetrievalDocument()
+        assert (
+            _document_to_retrieval_document(doc_neginf) == RetrievalDocument()
+        )
 
 
 class TestOnRetrieverError:
@@ -1443,7 +2299,6 @@ class TestOnRetrieverError:
         run_id = _run_id()
 
         handler.on_retriever_start(serialized={}, query="q", run_id=run_id)
-        retrieval_inv.span.is_recording.return_value = False
         handler.on_retriever_error(error=RuntimeError("boom"), run_id=run_id)
 
         assert run_id not in handler._invocation_manager._invocations
@@ -1485,23 +2340,25 @@ class TestOnLlmEndTokenDetails:
         handler.on_llm_end(response=response, run_id=run_id)
 
         assert llm_inv.input_tokens == 10
-        assert llm_inv.cache_creation_input_tokens == 3
+        assert llm_inv.cache_write_input_tokens == 3
         assert llm_inv.cache_read_input_tokens == 2
         assert llm_inv.thinking_tokens == 5
         assert llm_inv.output_tokens == 20
 
-    def test_audio_tokens_ignored(self):
+    def test_cache_write_tokens_set_on_invocation(self):
         run_id = _run_id()
         handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
 
         ai_msg = AIMessage(
-            content="hi",
+            content="hi there",
             usage_metadata={
-                "input_tokens": 10,
-                "output_tokens": 20,
-                "total_tokens": 30,
-                "input_token_details": {"audio": 5},
-                "output_token_details": {"audio": 4},
+                "input_tokens": 15,
+                "output_tokens": 25,
+                "total_tokens": 40,
+                "input_token_details": {
+                    "cache_write": 7,
+                    "cache_read": 3,
+                },
             },
         )
         gen = ChatGeneration(
@@ -1511,8 +2368,82 @@ class TestOnLlmEndTokenDetails:
 
         handler.on_llm_end(response=response, run_id=run_id)
 
-        assert llm_inv.input_tokens == 10
-        assert llm_inv.output_tokens == 20
+        assert llm_inv.input_tokens == 15
+        assert llm_inv.cache_write_input_tokens == 7
+        assert llm_inv.cache_read_input_tokens == 3
+        assert llm_inv.output_tokens == 25
+
+    def test_modality_tokens_set_on_invocation(self):
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+        ai_msg = AIMessage(
+            content="hi",
+            usage_metadata={
+                "input_tokens": 100,
+                "output_tokens": 50,
+                "total_tokens": 150,
+                "input_token_details": {
+                    "text": 70,
+                    "image": 20,
+                    "audio": 10,
+                },
+                "output_token_details": {
+                    "text": 35,
+                    "image": 10,
+                    "audio": 5,
+                },
+            },
+        )
+        gen = ChatGeneration(
+            message=ai_msg, generation_info={"finish_reason": "stop"}
+        )
+        response = LLMResult(generations=[[gen]])
+
+        handler.on_llm_end(response=response, run_id=run_id)
+
+        # The breakdown is applied by InferenceInvocation, so the handler's
+        # contract is the pairs it forwards. util-genai covers the mapping
+        # from those pairs onto span attributes.
+        assert llm_inv.input_tokens == 100
+        assert llm_inv.output_tokens == 50
+        # LangChain's pydantic model reorders the details mapping, so compare
+        # the pairs rather than their order.
+        (input_pairs,), _ = llm_inv.set_input_tokens.call_args
+        assert sorted(input_pairs) == [
+            ("audio", 10),
+            ("image", 20),
+            ("text", 70),
+        ]
+        (output_pairs,), _ = llm_inv.set_output_tokens.call_args
+        assert sorted(output_pairs) == [
+            ("audio", 5),
+            ("image", 10),
+            ("text", 35),
+        ]
+
+    def test_absent_token_details_forward_none(self):
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+        ai_msg = AIMessage(
+            content="hi",
+            usage_metadata={
+                "input_tokens": 1,
+                "output_tokens": 2,
+                "total_tokens": 3,
+            },
+        )
+        gen = ChatGeneration(
+            message=ai_msg, generation_info={"finish_reason": "stop"}
+        )
+
+        handler.on_llm_end(
+            response=LLMResult(generations=[[gen]]), run_id=run_id
+        )
+
+        llm_inv.set_input_tokens.assert_called_once_with(None)
+        llm_inv.set_output_tokens.assert_called_once_with(None)
 
 
 # ---------------------------------------------------------------------------
@@ -1530,27 +2461,74 @@ def test_extract_token_details_cache_and_reasoning():
     }
     details = extract_token_details(usage)
     assert details == {
-        "cache_creation_input_tokens": 3,
+        "cache_write_input_tokens": 3,
         "cache_read_input_tokens": 2,
         "reasoning_tokens": 5,
     }
 
 
-def test_extract_token_details_ignores_audio_tokens():
+def test_extract_token_details_cache_write_key():
     usage = {
         "input_tokens": 10,
         "output_tokens": 20,
-        "input_token_details": {"audio": 5},
-        "output_token_details": {"audio": 4},
+        "total_tokens": 30,
+        "input_token_details": {"cache_write": 4, "cache_read": 2},
+        "output_token_details": {"reasoning": 5},
     }
-    assert extract_token_details(usage) == {}
+    details = extract_token_details(usage)
+    assert details == {
+        "cache_write_input_tokens": 4,
+        "cache_read_input_tokens": 2,
+        "reasoning_tokens": 5,
+    }
+
+
+def test_extract_token_details_modalities():
+    usage = {
+        "input_tokens": 100,
+        "output_tokens": 50,
+        "input_token_details": {
+            "text": 70,
+            "image": 20,
+            "audio": 10,
+            "cache_write": 15,
+            "cache_read": 25,
+        },
+        "output_token_details": {
+            "text": 30,
+            "image": 15,
+            "audio": 5,
+            "reasoning": 10,
+        },
+    }
+    # Modality break-downs are forwarded to InferenceInvocation rather than
+    # flattened here, so only cache and reasoning remain.
+    details = extract_token_details(usage)
+    assert details == {
+        "cache_write_input_tokens": 15,
+        "cache_read_input_tokens": 25,
+        "reasoning_tokens": 10,
+    }
 
 
 def test_extract_token_details_zero_values_omitted():
     usage = {
         "input_tokens": 10,
         "output_tokens": 20,
-        "input_token_details": {"cache_creation": 0, "cache_read": 0},
+        "input_token_details": {
+            "cache_creation": 0,
+            "cache_write": 0,
+            "cache_read": 0,
+            "text": 0,
+            "image": 0,
+            "audio": 0,
+        },
+        "output_token_details": {
+            "reasoning": 0,
+            "text": 0,
+            "image": 0,
+            "audio": 0,
+        },
     }
     assert extract_token_details(usage) == {}
 
@@ -1558,37 +2536,54 @@ def test_extract_token_details_zero_values_omitted():
 def test_extract_token_details_no_details_key():
     assert extract_token_details({"input_tokens": 1, "output_tokens": 2}) == {}
 
-    def test_legacy_function_call_finish_reason_produces_tool_call_request(
-        self,
-    ):
-        """Pre-tools OpenAI ``function_call`` must surface as a ToolCallRequest."""
-        run_id = _run_id()
-        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
 
-        ai_msg = AIMessage(
-            content="",
-            additional_kwargs={
-                "function_call": {
-                    "name": "get_weather",
-                    "arguments": '{"city": "Paris"}',
-                }
-            },
-        )
-        gen = ChatGeneration(
-            message=ai_msg,
-            generation_info={"finish_reason": "function_call"},
-        )
-        response = LLMResult(generations=[[gen]])
+def test_extract_token_details_boolean_and_non_int_omitted():
+    usage = {
+        "input_token_details": {
+            "cache_write": True,
+            "cache_read": False,
+            "text": "10",
+            "image": None,
+            "audio": -5,
+        },
+        "output_token_details": {
+            "reasoning": True,
+            "text": [10],
+            "image": 0,
+        },
+    }
+    assert extract_token_details(usage) == {}
 
-        handler.on_llm_end(response=response, run_id=run_id)
 
-        assigned: list[OutputMessage] = llm_inv.output_messages
-        assert len(assigned) == 1
-        assert len(assigned[0].parts) == 1
-        part = assigned[0].parts[0]
-        assert isinstance(part, ToolCallRequest)
-        assert part.name == "get_weather"
-        assert part.arguments == {"city": "Paris"}
+def test_legacy_function_call_finish_reason_produces_tool_call_request():
+    """Pre-tools OpenAI ``function_call`` must surface as a ToolCallRequestPart."""
+    run_id = _run_id()
+    handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+    ai_msg = AIMessage(
+        content="",
+        additional_kwargs={
+            "function_call": {
+                "name": "get_weather",
+                "arguments": '{"city": "Paris"}',
+            }
+        },
+    )
+    gen = ChatGeneration(
+        message=ai_msg,
+        generation_info={"finish_reason": "function_call"},
+    )
+    response = LLMResult(generations=[[gen]])
+
+    handler.on_llm_end(response=response, run_id=run_id)
+
+    assigned: list[OutputMessage] = llm_inv.output_messages
+    assert len(assigned) == 1
+    assert len(assigned[0].parts) == 1
+    part = assigned[0].parts[0]
+    assert isinstance(part, ToolCallRequestPart)
+    assert part.name == "get_weather"
+    assert part.arguments == {"city": "Paris"}
 
 
 # ---------------------------------------------------------------------------
@@ -1607,7 +2602,7 @@ def test_legacy_function_call_dict_arguments():
         },
     )
     call = _legacy_function_call_request(message)
-    assert isinstance(call, ToolCallRequest)
+    assert isinstance(call, ToolCallRequestPart)
     assert call.name == "get_weather"
     assert call.arguments == {"city": "New York"}
 
@@ -1623,7 +2618,7 @@ def test_legacy_function_call_string_arguments_parsed():
         },
     )
     call = _legacy_function_call_request(message)
-    assert isinstance(call, ToolCallRequest)
+    assert isinstance(call, ToolCallRequestPart)
     assert call.arguments == {"city": "New York"}
 
 
@@ -1641,7 +2636,7 @@ def test_to_input_messages_includes_legacy_function_call():
     messages = to_input_messages([message])
     assert len(messages) == 1
     assert any(
-        isinstance(p, ToolCallRequest) and p.name == "f"
+        isinstance(p, ToolCallRequestPart) and p.name == "f"
         for p in messages[0].parts
     )
 
@@ -1764,3 +2759,909 @@ class TestOnLlmEndResponseModel:
         handler.on_llm_end(response=response, run_id=run_id)
 
         assert llm_inv.response_model_name == "gpt-4o"
+
+
+# ---------------------------------------------------------------------------
+# on_llm_end – streamed output messages
+# ---------------------------------------------------------------------------
+
+
+def test_streamed_output_message_role_is_assistant():
+    run_id = _run_id()
+    handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+    gen = ChatGenerationChunk(message=AIMessageChunk(content="hello"))
+
+    handler.on_llm_end(response=LLMResult(generations=[[gen]]), run_id=run_id)
+
+    (output_message,) = llm_inv.output_messages
+    assert output_message.role == "assistant"
+
+
+# ---------------------------------------------------------------------------
+# utils._normalize_role
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "message,expected_role",
+    [
+        (AIMessage(content="hi"), "assistant"),
+        (AIMessageChunk(content="hi"), "assistant"),
+        (HumanMessage(content="hi"), "user"),
+        (HumanMessageChunk(content="hi"), "user"),
+        (SystemMessage(content="hi"), "system"),
+        (SystemMessageChunk(content="hi"), "system"),
+        (ToolMessage(content="hi", tool_call_id="call_1"), "tool"),
+        (ToolMessageChunk(content="hi", tool_call_id="call_1"), "tool"),
+        (FunctionMessage(content="hi", name="f"), "tool"),
+        (FunctionMessageChunk(content="hi", name="f"), "tool"),
+    ],
+)
+def test_normalize_role_resolves_chunk_variants(message, expected_role):
+    """Chunk classes report their class name as ``.type``
+    (``AIMessageChunk.type == "AIMessageChunk"``), so they only resolve to a
+    spec role when matched by class."""
+    assert _normalize_role(message) == expected_role
+
+
+@pytest.mark.parametrize(
+    "message,expected_role",
+    [
+        (ChatMessage(content="hi", role="assistant"), "assistant"),
+        (ChatMessage(content="hi", role="custom"), "custom"),
+        (ChatMessageChunk(content="hi", role="custom"), "custom"),
+    ],
+)
+def test_normalize_role_reads_the_chat_message_role(message, expected_role):
+    """``ChatMessage`` keeps its speaker in ``role`` rather than in the class."""
+    assert _normalize_role(message) == expected_role
+
+
+def test_normalize_role_returns_none_for_unmapped_class():
+    assert _normalize_role(RemoveMessage(id="abc")) is None
+
+
+def test_chat_message_role_reaches_the_input_side():
+    (message,) = to_input_messages([ChatMessage(content="hi", role="custom")])
+    assert message.role == "custom"
+
+
+# on_llm_end – streamed responses
+#
+# Streaming reaches on_llm_end with an LLMResult that LangChain assembles from
+# the merged chunks alone, so ``llm_output`` — the usual source of
+# ``gen_ai.response.model`` and ``gen_ai.response.id`` — is never populated.
+# ---------------------------------------------------------------------------
+
+
+class TestOnLlmEndStreamedResponse:
+    def test_model_and_id_from_response_metadata(self):
+        """Both fields are read off the message's ``response_metadata``.
+
+        LangChain fills it with the union of ``generation_info`` and whatever
+        the provider wrote onto the message, so this is the one place that
+        covers every provider. The ``generation_info`` half of that union is
+        covered end to end by
+        ``test_chat_openai_streamed_response_model``, which drives a
+        real ``.stream()`` so LangChain performs the copy.
+        """
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+        gen = ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="hello",
+                response_metadata={
+                    "model_name": "claude-sonnet-4-5",
+                    "id": "msg_01ABC",
+                },
+            )
+        )
+
+        handler.on_llm_end(
+            response=LLMResult(generations=[[gen]]), run_id=run_id
+        )
+
+        assert llm_inv.response_model_name == "claude-sonnet-4-5"
+        assert llm_inv.response_id == "msg_01ABC"
+
+    def test_model_from_generation_info(self):
+        """A generation that skipped LangChain's merge still reports."""
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+        gen = ChatGenerationChunk(
+            message=AIMessageChunk(content="hello"),
+            generation_info={"model_name": "claude-sonnet-4-5"},
+        )
+
+        handler.on_llm_end(
+            response=LLMResult(generations=[[gen]]), run_id=run_id
+        )
+
+        assert llm_inv.response_model_name == "claude-sonnet-4-5"
+
+    def test_response_metadata_wins_over_generation_info(self):
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+        gen = ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="hello",
+                response_metadata={"model_name": "from-response-metadata"},
+            ),
+            generation_info={"model_name": "from-generation-info"},
+        )
+
+        handler.on_llm_end(
+            response=LLMResult(generations=[[gen]]), run_id=run_id
+        )
+
+        assert llm_inv.response_model_name == "from-response-metadata"
+
+    def test_message_id_not_used_as_response_id(self):
+        """LangChain puts its own run id on ``message.id`` when the provider
+        supplies none, which must not surface as ``gen_ai.response.id``."""
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+        llm_inv.response_id = None
+
+        gen = ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="hello", id=f"run--{run_id}", chunk_position="last"
+            )
+        )
+
+        handler.on_llm_end(
+            response=LLMResult(generations=[[gen]]), run_id=run_id
+        )
+
+        assert llm_inv.response_id is None
+
+    def test_llm_output_takes_precedence(self):
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+        gen = ChatGenerationChunk(
+            message=AIMessageChunk(content="hello"),
+            generation_info={"model_name": "from-generation"},
+        )
+
+        handler.on_llm_end(
+            response=LLMResult(
+                generations=[[gen]],
+                llm_output={"model_name": "from-llm-output"},
+            ),
+            run_id=run_id,
+        )
+
+        assert llm_inv.response_model_name == "from-llm-output"
+
+    def test_served_model_header_takes_precedence(self):
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+
+        gen = ChatGenerationChunk(
+            message=AIMessageChunk(
+                content="hello",
+                response_metadata={
+                    "headers": {"x-ms-served-model": "served-from-header"}
+                },
+            ),
+            generation_info={"model_name": "from-generation"},
+        )
+
+        handler.on_llm_end(
+            response=LLMResult(generations=[[gen]]), run_id=run_id
+        )
+
+        assert llm_inv.response_model_name == "served-from-header"
+
+    def test_no_model_reported_leaves_attribute_unset(self):
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+        llm_inv.response_model_name = None
+
+        gen = ChatGenerationChunk(message=AIMessageChunk(content="hello"))
+
+        handler.on_llm_end(
+            response=LLMResult(generations=[[gen]]), run_id=run_id
+        )
+
+        assert llm_inv.response_model_name is None
+
+    def test_no_id_reported_leaves_attribute_unset(self):
+        run_id = _run_id()
+        handler, _, llm_inv = _make_handler_with_llm_invocation(run_id)
+        llm_inv.response_id = None
+
+        gen = ChatGenerationChunk(message=AIMessageChunk(content="hello"))
+
+        handler.on_llm_end(
+            response=LLMResult(generations=[[gen]]), run_id=run_id
+        )
+
+        assert llm_inv.response_id is None
+
+
+# ---------------------------------------------------------------------------
+# utils._media_part - LangChain multimodal image block parsing
+# ---------------------------------------------------------------------------
+
+_REAL_PNG_BYTES = (
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00"
+    b"\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc"
+    b"\xf8\xcf\xc0\xf0\x1f\x00\x05\x05\x02\x00\xa1\r\xf7\xdf\x00\x00\x00"
+    b"\x00IEND\xaeB`\x82"
+)
+_REAL_PNG_B64 = base64.b64encode(_REAL_PNG_BYTES).decode("ascii")
+
+
+def test_media_part_openai_image_url_dict():
+    item = {
+        "type": "image_url",
+        "image_url": {"url": "https://example.com/a.png"},
+    }
+    part = _media_part(item)
+    assert isinstance(part, UriPart)
+    assert part.uri == "https://example.com/a.png"
+
+
+def test_media_part_openai_image_url_string():
+    item = {"type": "image_url", "image_url": "https://example.com/b.png"}
+    part = _media_part(item)
+    assert isinstance(part, UriPart)
+    assert part.uri == "https://example.com/b.png"
+
+
+def test_media_part_anthropic_base64_source_returns_blob():
+    item = {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "R0lGODlh",
+        },
+    }
+    part = _media_part(item)
+    assert isinstance(part, BlobPart)
+    assert part.mime_type == "image/png"
+    assert part.content == b"GIF89a"
+
+
+def test_media_part_anthropic_base64_source_without_media_type():
+    item = {
+        "type": "image",
+        "source": {"type": "base64", "data": "QUJD"},
+    }
+    part = _media_part(item)
+    assert isinstance(part, BlobPart)
+    assert part.mime_type is None
+    assert part.content == b"ABC"
+
+
+def test_media_part_base64_source_decodes_real_png():
+    item = {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": _REAL_PNG_B64,
+        },
+    }
+    part = _media_part(item)
+    assert isinstance(part, BlobPart)
+    assert part.content == _REAL_PNG_BYTES
+
+
+def test_media_part_anthropic_url_source_returns_uri():
+    item = {
+        "type": "image",
+        "source": {"type": "url", "url": "https://example.com/c.png"},
+    }
+    part = _media_part(item)
+    assert isinstance(part, UriPart)
+    assert part.uri == "https://example.com/c.png"
+
+
+def test_media_part_unrecognized_returns_none():
+    assert _media_part({"type": "text", "text": "hi"}) is None
+    assert _media_part({"type": "image_url", "image_url": {}}) is None
+    assert (
+        _media_part({"type": "image_url", "image_url": {"url": 123}}) is None
+    )
+    assert _media_part({"type": "image", "source": "nope"}) is None
+    assert (
+        _media_part({"type": "image", "source": {"type": "base64", "data": 5}})
+        is None
+    )
+    assert (
+        _media_part({"type": "image", "source": {"type": "url", "url": ""}})
+        is None
+    )
+
+
+def test_media_part_malformed_base64_returns_none():
+    item = {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": "not!valid!base64!",
+        },
+    }
+    assert _media_part(item) is None
+
+
+def test_media_part_openai_real_png_data_uri_returns_blob():
+    item = {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{_REAL_PNG_B64}"},
+    }
+    part = _media_part(item)
+    assert isinstance(part, BlobPart)
+    assert part.mime_type == "image/png"
+    assert part.content == _REAL_PNG_BYTES
+
+
+def test_media_part_anthropic_real_png_source_returns_blob():
+    item = {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": _REAL_PNG_B64,
+        },
+    }
+    part = _media_part(item)
+    assert isinstance(part, BlobPart)
+    assert part.mime_type == "image/png"
+    assert part.content == _REAL_PNG_BYTES
+
+
+def test_media_part_anthropic_real_png_corrupted_base64_returns_none():
+    corrupted = _REAL_PNG_B64[:10] + "@@@@" + _REAL_PNG_B64[14:]
+    item = {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/png",
+            "data": corrupted,
+        },
+    }
+    assert _media_part(item) is None
+
+
+def test_media_part_real_png_url_source_returns_uri():
+    item = {
+        "type": "image",
+        "source": {
+            "type": "url",
+            "url": "https://example.com/real-image.png",
+        },
+    }
+    part = _media_part(item)
+    assert isinstance(part, UriPart)
+    assert part.uri == "https://example.com/real-image.png"
+
+
+def test_media_part_standard_v1_base64_block_returns_blob():
+    item = {
+        "type": "image",
+        "base64": _REAL_PNG_B64,
+        "mime_type": "image/png",
+    }
+    part = _media_part(item)
+    assert isinstance(part, BlobPart)
+    assert part.mime_type == "image/png"
+    assert part.content == _REAL_PNG_BYTES
+
+
+def test_media_part_standard_v1_url_block_returns_uri():
+    item = {"type": "image", "url": "https://example.com/a.png"}
+    part = _media_part(item)
+    assert isinstance(part, UriPart)
+    assert part.uri == "https://example.com/a.png"
+
+
+def test_media_part_standard_block_without_mime_type_returns_blob():
+    part = _media_part({"type": "image", "base64": _REAL_PNG_B64})
+    assert isinstance(part, BlobPart)
+    assert part.mime_type is None
+    assert part.content == _REAL_PNG_BYTES
+
+
+def test_media_part_standard_v03_block_without_mime_type_returns_blob():
+    part = _media_part(
+        {"type": "image", "source_type": "base64", "data": _REAL_PNG_B64}
+    )
+    assert isinstance(part, BlobPart)
+    assert part.mime_type is None
+
+
+def test_media_part_non_dict_source_falls_through_to_standard_keys():
+    """A non-dict ``source`` must not shadow a standard payload."""
+    part = _media_part(
+        {
+            "type": "image",
+            "source": "not-a-dict",
+            "base64": _REAL_PNG_B64,
+            "mime_type": "image/png",
+        }
+    )
+    assert isinstance(part, BlobPart)
+    assert part.content == _REAL_PNG_BYTES
+
+
+def test_media_part_anthropic_source_takes_precedence_over_standard_keys():
+    """Anthropic's ``source`` is checked before the standard top-level keys."""
+    part = _media_part(
+        {
+            "type": "image",
+            "source": {"type": "url", "url": "https://example.com/from.png"},
+            "url": "https://example.com/ignored.png",
+        }
+    )
+    assert isinstance(part, UriPart)
+    assert part.uri == "https://example.com/from.png"
+
+
+def test_media_part_v03_url_source_type_does_not_fall_through_to_base64():
+    """An explicit ``source_type`` pins the variant, even when it is broken."""
+    part = _media_part(
+        {
+            "type": "image",
+            "source_type": "url",
+            "url": None,
+            "base64": _REAL_PNG_B64,
+        }
+    )
+    assert part is None
+
+
+def test_media_part_standard_v03_base64_block_returns_blob():
+    item = {
+        "type": "image",
+        "source_type": "base64",
+        "data": _REAL_PNG_B64,
+        "mime_type": "image/png",
+    }
+    part = _media_part(item)
+    assert isinstance(part, BlobPart)
+    assert part.mime_type == "image/png"
+    assert part.content == _REAL_PNG_BYTES
+
+
+def test_media_part_standard_v03_url_block_returns_uri():
+    item = {
+        "type": "image",
+        "source_type": "url",
+        "url": "https://example.com/b.png",
+    }
+    part = _media_part(item)
+    assert isinstance(part, UriPart)
+    assert part.uri == "https://example.com/b.png"
+
+
+def test_media_part_standard_block_corrupted_base64_returns_none():
+    corrupted = _REAL_PNG_B64[:10] + "@@@@" + _REAL_PNG_B64[14:]
+    assert (
+        _media_part(
+            {"type": "image", "base64": corrupted, "mime_type": "image/png"}
+        )
+        is None
+    )
+
+
+def test_media_part_standard_block_without_payload_returns_none():
+    assert _media_part({"type": "image", "mime_type": "image/png"}) is None
+
+
+@pytest.mark.parametrize(
+    "block,expected,expected_value",
+    [
+        (
+            {
+                "type": "image",
+                "base64": _REAL_PNG_B64,
+                "mime_type": "image/png",
+            },
+            BlobPart,
+            _REAL_PNG_BYTES,
+        ),
+        (
+            {"type": "image", "url": "https://example.com/a.png"},
+            UriPart,
+            "https://example.com/a.png",
+        ),
+        (
+            {
+                "type": "image",
+                "source_type": "base64",
+                "data": _REAL_PNG_B64,
+                "mime_type": "image/png",
+            },
+            BlobPart,
+            _REAL_PNG_BYTES,
+        ),
+        (
+            {
+                "type": "image",
+                "source_type": "url",
+                "url": "https://e/b.png",
+            },
+            UriPart,
+            "https://e/b.png",
+        ),
+        (
+            {"type": "image", "source_type": "id", "id": "file-123"},
+            FilePart,
+            "file-123",
+        ),
+        (
+            {"type": "image", "id": "file-456"},
+            FilePart,
+            "file-456",
+        ),
+        (
+            {
+                "type": "image",
+                "source": {"type": "file", "file_id": "file-789"},
+            },
+            FilePart,
+            "file-789",
+        ),
+    ],
+)
+def test_langchain_standard_image_blocks_are_captured(
+    block, expected, expected_value
+):
+    messages = to_input_messages([HumanMessage(content=[block])])
+    assert messages, "message dropped entirely - no parts extracted"
+    part = next(p for p in messages[0].parts if isinstance(p, expected))
+    assert part.modality == "image"
+    assert _part_payload(part) == expected_value
+
+
+@pytest.mark.parametrize(
+    "block,expected,expected_value",
+    [
+        (
+            {
+                "type": "input_image",
+                "image_url": f"data:image/png;base64,{_REAL_PNG_B64}",
+            },
+            BlobPart,
+            _REAL_PNG_BYTES,
+        ),
+        (
+            {"type": "input_image", "image_url": "https://example.com/a.png"},
+            UriPart,
+            "https://example.com/a.png",
+        ),
+        (
+            {
+                "type": "input_image",
+                "image_url": {"url": "https://example.com/a.png"},
+            },
+            UriPart,
+            "https://example.com/a.png",
+        ),
+        (
+            {"type": "input_image", "file_id": "file-123"},
+            FilePart,
+            "file-123",
+        ),
+    ],
+)
+def test_responses_api_input_image_blocks_are_captured(
+    block, expected, expected_value
+):
+    messages = to_input_messages([HumanMessage(content=[block])])
+    assert messages, "message dropped entirely - no parts extracted"
+    part = next(p for p in messages[0].parts if isinstance(p, expected))
+    assert part.modality == "image"
+    assert _part_payload(part) == expected_value
+
+
+def _part_payload(part):
+    if isinstance(part, BlobPart):
+        return part.content
+    if isinstance(part, UriPart):
+        return part.uri
+    return part.file_id
+
+
+def test_media_part_responses_api_input_image_base64_url():
+    part = _media_part(
+        {
+            "type": "input_image",
+            "image_url": f"data:image/png;base64,{_REAL_PNG_B64}",
+        }
+    )
+    assert isinstance(part, BlobPart)
+    assert part.mime_type == "image/png"
+    assert part.modality == "image"
+    assert part.content == _REAL_PNG_BYTES
+
+
+def test_media_part_responses_api_input_image_file_id_returns_file_part():
+    # Provider-hosted image: no bytes and no URL, but the reference is still
+    # worth recording.
+    part = _media_part({"type": "input_image", "file_id": "file-123"})
+    assert isinstance(part, FilePart)
+    assert part.file_id == "file-123"
+    assert part.modality == "image"
+    assert part.mime_type is None
+
+
+def test_media_part_anthropic_file_source_returns_file_part():
+    part = _media_part(
+        {
+            "type": "image",
+            "source": {
+                "type": "file",
+                "file_id": "file-789",
+                "media_type": "image/png",
+            },
+        }
+    )
+    assert isinstance(part, FilePart)
+    assert part.file_id == "file-789"
+    assert part.mime_type == "image/png"
+
+
+def test_media_part_anthropic_file_source_without_file_id_returns_none():
+    assert _media_part({"type": "image", "source": {"type": "file"}}) is None
+
+
+def test_responses_api_input_text_block_is_captured():
+    messages = to_input_messages(
+        [
+            HumanMessage(
+                content=[{"type": "input_text", "text": "what is this?"}]
+            )
+        ]
+    )
+    assert len(messages) == 1
+    parts = messages[0].parts
+    assert len(parts) == 1
+    assert isinstance(parts[0], TextPart)
+    assert parts[0].content == "what is this?"
+
+
+def test_responses_api_output_text_block_is_captured():
+    # langchain-openai accepts "output_text" on an assistant turn fed back in
+    # as request input.
+    messages = to_input_messages(
+        [AIMessage(content=[{"type": "output_text", "text": "the answer"}])]
+    )
+    assert len(messages) == 1
+    assert messages[0].role == "assistant"
+    parts = messages[0].parts
+    assert len(parts) == 1
+    assert isinstance(parts[0], TextPart)
+    assert parts[0].content == "the answer"
+
+
+def test_message_survives_unconvertible_image_block():
+    # An image block with no bytes, url, or file id has nothing to record.
+    messages = to_input_messages(
+        [HumanMessage(content=[{"type": "image", "detail": "high"}])]
+    )
+    assert messages, "message dropped entirely"
+    assert messages[0].role == "user"
+    assert messages[0].parts == []
+
+
+def test_text_kept_when_image_block_is_unconvertible():
+    messages = to_input_messages(
+        [
+            HumanMessage(
+                content=[
+                    {"type": "input_text", "text": "what is in this image?"},
+                    {"type": "input_image", "detail": "high"},
+                ]
+            )
+        ]
+    )
+    assert messages, "message dropped entirely"
+    assert any(isinstance(p, TextPart) for p in messages[0].parts)
+
+
+def test_message_with_only_unknown_blocks_is_kept():
+    messages = to_input_messages(
+        [HumanMessage(content=[{"type": "input_file", "file_id": "file-1"}])]
+    )
+    assert messages
+    assert messages[0].parts == []
+
+
+def test_empty_message_is_still_dropped():
+    assert to_input_messages([HumanMessage(content="")]) == []
+    assert to_input_messages([HumanMessage(content=[])]) == []
+
+
+@pytest.mark.parametrize("content", [[""], ["", ""], [{}], ["", {}]])
+def test_message_of_blank_blocks_is_dropped(content):
+    # Blank blocks are empty content, not content we failed to convert.
+    assert to_input_messages([HumanMessage(content=content)]) == []
+
+
+def test_output_message_survives_unconvertible_blocks():
+    # A dropped output message would also lose its finish_reason.
+    messages = to_output_messages(
+        [AIMessage(content=[{"type": "input_file", "file_id": "file-1"}])],
+        finish_reason="stop",
+    )
+    assert messages
+    assert messages[0].parts == []
+    assert messages[0].finish_reason == "stop"
+
+
+def test_empty_output_message_is_still_dropped():
+    assert to_output_messages([AIMessage(content="")]) == []
+
+
+def test_to_input_messages_extracts_image_part():
+    image_url = "data:image/jpeg;base64,QUJD"
+    content = [
+        {"type": "text", "text": "What's in this image?"},
+        {"type": "image_url", "image_url": {"url": image_url}},
+    ]
+    messages = to_input_messages([HumanMessage(content=content)])
+    assert len(messages) == 1
+    parts = messages[0].parts
+
+    assert any(isinstance(p, BlobPart) for p in parts)
+    blob = next(p for p in parts if isinstance(p, BlobPart))
+    assert blob.mime_type == "image/jpeg"
+    assert blob.content == b"ABC"
+
+
+def test_on_chat_model_start_skips_input_messages_when_content_disabled():
+    """Gating happens in the callback handler, not inside the utils."""
+    run_id = _run_id()
+    handler, telemetry, llm_inv = _make_handler_with_llm_invocation(run_id)
+    telemetry.should_capture_content.return_value = False
+
+    content = [
+        {"type": "text", "text": "What's in this image?"},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{_REAL_PNG_B64}"},
+        },
+    ]
+    handler.on_chat_model_start(
+        serialized={},
+        messages=[[HumanMessage(content=content)]],
+        run_id=_run_id(),
+        invocation_params={"model_name": "gpt-4o"},
+    )
+
+    assert llm_inv.input_messages == []
+
+
+def test_on_chat_model_start_captures_input_messages_when_content_enabled():
+    run_id = _run_id()
+    handler, telemetry, llm_inv = _make_handler_with_llm_invocation(run_id)
+    telemetry.should_capture_content.return_value = True
+
+    content = [
+        {"type": "text", "text": "What's in this image?"},
+        {
+            "type": "image_url",
+            "image_url": {"url": f"data:image/png;base64,{_REAL_PNG_B64}"},
+        },
+    ]
+    handler.on_chat_model_start(
+        serialized={},
+        messages=[[HumanMessage(content=content)]],
+        run_id=_run_id(),
+        invocation_params={"model_name": "gpt-4o"},
+    )
+
+    parts = llm_inv.input_messages[0].parts
+    assert any(isinstance(p, TextPart) for p in parts)
+    blob = next(p for p in parts if isinstance(p, BlobPart))
+    assert blob.content == _REAL_PNG_BYTES
+
+
+def test_on_chat_model_start_preserves_message_name():
+    run_id = _run_id()
+    handler, telemetry, llm_inv = _make_handler_with_llm_invocation(run_id)
+    telemetry.should_capture_content.return_value = True
+
+    handler.on_chat_model_start(
+        serialized={},
+        messages=[[HumanMessage(content="Hello", name="Alice")]],
+        run_id=run_id,
+        invocation_params={"model_name": "gpt-4o"},
+    )
+
+    assert len(llm_inv.input_messages) == 1
+    assert llm_inv.input_messages[0].name == "Alice"
+
+
+def test_explicit_attach_to_context_false():
+    telemetry = mock.MagicMock()
+    workflow_inv = mock.MagicMock(spec=WorkflowInvocation)
+    telemetry.workflow.return_value = workflow_inv
+
+    handler = OpenTelemetryLangChainCallbackHandler(
+        telemetry, _attach_to_context=False
+    )
+    run_id = _run_id()
+
+    handler.on_chain_start(
+        serialized={"name": "LangGraph", "id": ["langgraph"]},
+        inputs={},
+        run_id=run_id,
+        parent_run_id=None,
+    )
+
+    telemetry.workflow.assert_called_once_with(
+        name="LangGraph",
+        context=None,
+        conversation_id=None,
+        _attach_to_context=False,
+    )
+
+
+def test_sync_defaults_attach_to_context_true():
+    telemetry = mock.MagicMock()
+    workflow_inv = mock.MagicMock(spec=WorkflowInvocation)
+    telemetry.workflow.return_value = workflow_inv
+
+    handler = OpenTelemetryLangChainCallbackHandler(telemetry)
+    run_id = _run_id()
+
+    handler.on_chain_start(
+        serialized={"name": "LangGraph", "id": ["langgraph"]},
+        inputs={},
+        run_id=run_id,
+        parent_run_id=None,
+    )
+
+    telemetry.workflow.assert_called_once_with(
+        name="LangGraph",
+        context=None,
+        conversation_id=None,
+        _attach_to_context=True,
+    )
+
+
+def test_instrumentor_routes_sync_and_async_callback_managers():
+    from langchain_core.callbacks.manager import (
+        AsyncCallbackManager,
+        CallbackManager,
+    )
+
+    from opentelemetry.instrumentation.genai.langchain import (
+        LangChainInstrumentor,
+    )
+
+    LangChainInstrumentor().instrument()
+    try:
+        cm = CallbackManager([])
+        sync_handlers = [
+            h
+            for h in cm.handlers
+            if isinstance(h, OpenTelemetryLangChainCallbackHandler)
+        ]
+        assert len(sync_handlers) == 1
+        assert sync_handlers[0]._attach_to_context is True
+        assert sync_handlers[0].run_inline is False
+
+        acm = AsyncCallbackManager([])
+        async_handlers = [
+            h
+            for h in acm.handlers
+            if isinstance(h, OpenTelemetryLangChainCallbackHandler)
+        ]
+        assert len(async_handlers) == 1
+        assert async_handlers[0]._attach_to_context is False
+        assert async_handlers[0].run_inline is False
+    finally:
+        LangChainInstrumentor().uninstrument()

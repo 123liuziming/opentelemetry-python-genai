@@ -5,18 +5,23 @@
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import json
+from types import AsyncGeneratorType
 
 import pytest
+from packaging.version import Version
 
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAI,
 )
-from opentelemetry.semconv._incubating.metrics import gen_ai_metrics
 from opentelemetry.semconv.attributes import error_attributes
 from opentelemetry.trace import SpanKind, StatusCode
+from opentelemetry.util.genai.version import __version__ as util_genai_version
 
 from .harness import (
+    assistant_reply,
     failing_run_command_path,
     fake_run_command_path,
     make_request,
@@ -77,7 +82,7 @@ async def test_query_handler_emits_invoke_agent_span(
 
     # `agent_name` was added during the qwenpaw 1.1.x line, so the attribute
     # (and span-name suffix) is optional on the oldest supported version.
-    agent_name = getattr(runner, "agent_name", None)
+    agent_name = getattr(runner, "_agent_name", None)
     if agent_name:
         assert span.name == f"invoke_agent {agent_name}"
         assert attributes[GenAI.GEN_AI_AGENT_NAME] == agent_name
@@ -152,9 +157,10 @@ async def test_query_handler_captures_messages_in_span_only_mode(
     assert isinstance(attributes[GenAI.GEN_AI_OUTPUT_MESSAGES], str)
     output_messages = json.loads(attributes[GenAI.GEN_AI_OUTPUT_MESSAGES])
     assert output_messages[0]["role"] == "assistant"
-    assert output_messages[0]["finish_reason"] == "stop"
+    assert output_messages[0].get("finish_reason") is None
     assert output_messages[0]["parts"][0]["type"] == "text"
     assert output_messages[0]["parts"][0]["content"] == "hello-output"
+    assert attributes[GenAI.GEN_AI_RESPONSE_FINISH_REASONS] == ("stop",)
 
 
 @pytest.mark.asyncio
@@ -171,51 +177,74 @@ async def test_query_handler_omits_messages_without_content_capture(
     attributes = dict(span.attributes or {})
     assert GenAI.GEN_AI_INPUT_MESSAGES not in attributes
     assert GenAI.GEN_AI_OUTPUT_MESSAGES not in attributes
+    assert attributes[GenAI.GEN_AI_RESPONSE_FINISH_REASONS] == ("stop",)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "error_type"),
+    [
+        (ConnectionError("boom"), "ConnectionError"),
+        (
+            asyncio.CancelledError("cancelled"),
+            "asyncio.exceptions.CancelledError",
+        ),
+    ],
+)
 async def test_stream_side_error_reraises_and_fails_span(
+    instrument_with_content,
+    runner_module,
+    span_exporter,
+    error,
+    error_type,
+):
+    runner = runner_module.AgentRunner(agent_id="entry-agent")
+    with patched_command_path(runner_module, failing_run_command_path(error)):
+        with pytest.raises(type(error)) as raised:
+            await _drain(
+                runner.query_handler(user_command_msgs(), make_request())
+            )
+    assert raised.value is error
+
+    (span,) = span_exporter.get_finished_spans()
+    assert span.status.status_code == StatusCode.ERROR
+    attributes = dict(span.attributes or {})
+    assert attributes[error_attributes.ERROR_TYPE] == error_type
+    assert isinstance(attributes[error_attributes.ERROR_TYPE], str)
+    # Output captured before the failure must survive on the error span.
+    output_messages = json.loads(attributes[GenAI.GEN_AI_OUTPUT_MESSAGES])
+    assert output_messages[0]["parts"][0]["content"] == "partial"
+    assert output_messages[0].get("finish_reason") is None
+    assert GenAI.GEN_AI_RESPONSE_FINISH_REASONS not in attributes
+
+
+@pytest.mark.asyncio
+async def test_caller_side_error_reraises_and_fails_span(
     instrument_with_content,
     runner_module,
     span_exporter,
 ):
     runner = runner_module.AgentRunner(agent_id="entry-agent")
+    error = ValueError("caller bug")
     with patched_command_path(
-        runner_module, failing_run_command_path(ConnectionError("boom"))
+        runner_module, fake_run_command_path("partial", last=False)
     ):
-        with pytest.raises(ConnectionError, match="boom"):
-            await _drain(
-                runner.query_handler(user_command_msgs(), make_request())
-            )
-
-    (span,) = span_exporter.get_finished_spans()
-    assert span.status.status_code == StatusCode.ERROR
-    attributes = dict(span.attributes or {})
-    assert attributes[error_attributes.ERROR_TYPE] == "ConnectionError"
-    assert isinstance(attributes[error_attributes.ERROR_TYPE], str)
-    # Output captured before the failure must survive on the error span.
-    output_messages = json.loads(attributes[GenAI.GEN_AI_OUTPUT_MESSAGES])
-    assert output_messages[0]["parts"][0]["content"] == "partial"
-
-
-@pytest.mark.asyncio
-async def test_caller_side_error_reraises_and_fails_span(
-    instrument_no_content,
-    runner_module,
-    span_exporter,
-):
-    runner = runner_module.AgentRunner(agent_id="entry-agent")
-    with patched_command_path(runner_module, fake_run_command_path("ok")):
-        with pytest.raises(ValueError, match="caller bug"):
+        with pytest.raises(ValueError, match="caller bug") as raised:
             async with runner.query_handler(
                 user_command_msgs(), make_request()
-            ):
-                raise ValueError("caller bug")
+            ) as stream:
+                await anext(stream)
+                raise error
+    assert raised.value is error
 
     (span,) = span_exporter.get_finished_spans()
     assert span.status.status_code == StatusCode.ERROR
     attributes = dict(span.attributes or {})
     assert attributes[error_attributes.ERROR_TYPE] == "ValueError"
+    assert GenAI.GEN_AI_RESPONSE_FINISH_REASONS not in attributes
+    output_messages = json.loads(attributes[GenAI.GEN_AI_OUTPUT_MESSAGES])
+    assert output_messages[0]["parts"][0]["content"] == "partial"
+    assert output_messages[0].get("finish_reason") is None
 
 
 @pytest.mark.asyncio
@@ -228,7 +257,7 @@ async def test_caller_side_error_closes_the_underlying_generator(
     del span_exporter
     runner = runner_module.AgentRunner(agent_id="entry-agent")
     with patched_command_path(
-        runner_module, fake_run_command_path("early-output")
+        runner_module, fake_run_command_path("early-output", last=False)
     ):
         stream = runner.query_handler(user_command_msgs(), make_request())
         with pytest.raises(ValueError, match="caller bug"):
@@ -248,7 +277,7 @@ async def test_early_close_finalizes_span_with_partial_output(
 ):
     runner = runner_module.AgentRunner(agent_id="entry-agent")
     with patched_command_path(
-        runner_module, fake_run_command_path("early-output")
+        runner_module, fake_run_command_path("early-output", last=False)
     ):
         stream = runner.query_handler(user_command_msgs(), make_request())
         first = await anext(stream)
@@ -260,6 +289,85 @@ async def test_early_close_finalizes_span_with_partial_output(
     attributes = dict(span.attributes or {})
     output_messages = json.loads(attributes[GenAI.GEN_AI_OUTPUT_MESSAGES])
     assert output_messages[0]["parts"][0]["content"] == "early-output"
+    assert output_messages[0].get("finish_reason") is None
+    assert GenAI.GEN_AI_RESPONSE_FINISH_REASONS not in attributes
+    assert stream.ag_frame is None
+
+
+@pytest.mark.asyncio
+async def test_stream_preserves_async_generator_contract(
+    instrument_no_content, runner_module, span_exporter
+) -> None:
+    runner = runner_module.AgentRunner(agent_id="entry-agent")
+    with patched_command_path(runner_module, fake_run_command_path("ok")):
+        stream = runner.query_handler(user_command_msgs(), make_request())
+        assert isinstance(stream, AsyncGeneratorType)
+        assert stream.__class__ is AsyncGeneratorType
+        assert hasattr(stream, "aclose")
+        assert not hasattr(stream, "close")
+        assert span_exporter.get_finished_spans() == ()
+        await stream.aclose()
+        await stream.aclose()
+
+    (span,) = span_exporter.get_finished_spans()
+    assert GenAI.GEN_AI_RESPONSE_FINISH_REASONS not in span.attributes
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_role", ["assistant", "system"])
+async def test_partial_or_non_assistant_output_omits_finish_reason(
+    instrument_with_content, runner_module, span_exporter, final_role
+) -> None:
+    from agentscope.message import Msg
+
+    async def messages(request, msgs, runner):
+        del request, msgs, runner
+        yield assistant_reply("first message"), True
+        yield (
+            Msg(name="Friday", role=final_role, content="next message"),
+            final_role == "system",
+        )
+
+    runner = runner_module.AgentRunner(agent_id="entry-agent")
+    with patched_command_path(runner_module, messages):
+        await _drain(runner.query_handler(user_command_msgs(), make_request()))
+
+    (span,) = span_exporter.get_finished_spans()
+    assert GenAI.GEN_AI_RESPONSE_FINISH_REASONS not in span.attributes
+
+
+@pytest.mark.asyncio
+@pytest.mark.xfail(
+    Version(util_genai_version) < Version("1.3b0.dev"),
+    reason="Shared stream abandonment finalization requires util-genai 1.3b0.dev (#386)",
+    strict=True,
+    run=False,
+)
+async def test_abandoned_stream_finalizes_span_with_partial_output(
+    instrument_with_content, runner_module, span_exporter
+) -> None:
+    runner = runner_module.AgentRunner(agent_id="entry-agent")
+    with patched_command_path(
+        runner_module, fake_run_command_path("partial", last=False)
+    ):
+        stream = runner.query_handler(user_command_msgs(), make_request())
+        underlying = stream.__wrapped__
+        async for _ in stream:
+            break
+        assert span_exporter.get_finished_spans() == ()
+        del stream
+        gc.collect()
+        await underlying.aclose()
+
+    (span,) = span_exporter.get_finished_spans()
+    assert span.status.status_code == StatusCode.ERROR
+    assert span.status.description == "abandoned stream"
+    attributes = dict(span.attributes or {})
+    assert attributes[error_attributes.ERROR_TYPE] == "_OTHER"
+    assert GenAI.GEN_AI_RESPONSE_FINISH_REASONS not in attributes
+    output_messages = json.loads(attributes[GenAI.GEN_AI_OUTPUT_MESSAGES])
+    assert output_messages[0]["parts"][0]["content"] == "partial"
+    assert output_messages[0].get("finish_reason") is None
 
 
 @pytest.mark.asyncio
@@ -283,12 +391,12 @@ async def test_operation_duration_metric_recorded(
     # so only the operation duration is recorded — no streamed-call metrics
     # such as time_to_first_chunk.
     assert {metric.name for metric in all_metrics} == {
-        gen_ai_metrics.GEN_AI_CLIENT_OPERATION_DURATION
+        "gen_ai.invoke_agent.duration"
     }
     duration_metrics = [
         metric
         for metric in all_metrics
-        if metric.name == gen_ai_metrics.GEN_AI_CLIENT_OPERATION_DURATION
+        if metric.name == "gen_ai.invoke_agent.duration"
     ]
     assert len(duration_metrics) == 1
     data_points = list(duration_metrics[0].data.data_points)
@@ -296,10 +404,7 @@ async def test_operation_duration_metric_recorded(
     point = data_points[0]
     assert point.count == 1
     assert point.sum >= 0
-    assert (
-        point.attributes[GenAI.GEN_AI_OPERATION_NAME]
-        == GenAI.GenAiOperationNameValues.INVOKE_AGENT.value
-    )
+    assert GenAI.GEN_AI_OPERATION_NAME not in point.attributes
 
 
 @pytest.mark.asyncio

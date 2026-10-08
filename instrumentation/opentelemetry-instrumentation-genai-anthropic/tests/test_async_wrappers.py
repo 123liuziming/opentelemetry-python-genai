@@ -11,6 +11,10 @@ from opentelemetry.instrumentation.genai.anthropic.wrappers import (
     MessagesStreamManagerWrapper,
     MessagesStreamWrapper,
 )
+from opentelemetry.semconv._incubating.attributes import (
+    gen_ai_attributes as GenAIAttributes,
+)
+from opentelemetry.util.genai.handler import TelemetryHandler
 
 
 def _make_invocation():
@@ -151,24 +155,6 @@ class _FakeAsyncManager:
         return self._suppressed
 
 
-class _FakeStreamWrapper:
-    def __init__(self):
-        self.exit_args = None
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.exit_args = (exc_type, exc_val, exc_tb)
-        return False
-
-
-class _FakeAsyncStreamWrapper:
-    def __init__(self):
-        self.exit_args = None
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        self.exit_args = (exc_type, exc_val, exc_tb)
-        return False
-
-
 class _FakeSyncResponse:
     def __init__(self):
         self.request_id = "req_sync"
@@ -189,6 +175,63 @@ class _FakeAsyncResponse:
 
     async def aclose(self):
         self.aclose_calls += 1
+
+
+@pytest.mark.parametrize(
+    ("wrapper_type", "stream_type"),
+    [
+        (MessagesStreamWrapper, _FakeSyncStream),
+        (AsyncMessagesStreamWrapper, _FakeAsyncStream),
+    ],
+)
+def test_stream_wrapper_finalization_records_thinking_tokens(
+    wrapper_type,
+    stream_type,
+    tracer_provider,
+    logger_provider,
+    meter_provider,
+    span_exporter,
+):
+    handler = TelemetryHandler(
+        tracer_provider=tracer_provider,
+        logger_provider=logger_provider,
+        meter_provider=meter_provider,
+        instrumentation_scope_name=(
+            "opentelemetry.instrumentation.genai.anthropic"
+        ),
+    )
+    invocation = handler.inference(
+        provider="anthropic",
+        request_model="claude-sonnet-4-20250514",
+    )
+    snapshot = SimpleNamespace(
+        id="msg_stream",
+        model="claude-sonnet-4-20250514",
+        stop_reason="end_turn",
+        usage=SimpleNamespace(
+            input_tokens=10,
+            output_tokens=20,
+            output_tokens_details=SimpleNamespace(thinking_tokens=12),
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+        ),
+    )
+    wrapper = wrapper_type(
+        stream=stream_type(current_message_snapshot=snapshot),
+        invocation=invocation,
+        capture_content=False,
+    )
+
+    wrapper._stop()
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert (
+        spans[0].attributes[
+            GenAIAttributes.GEN_AI_USAGE_REASONING_OUTPUT_TOKENS
+        ]
+        == 12
+    )
 
 
 def test_sync_stream_wrapper_exit_closes_without_exception():
@@ -322,7 +365,6 @@ def test_sync_manager_enter_constructs_stream_wrapper():
     with wrapper as result:
         assert isinstance(result, MessagesStreamWrapper)
         assert result.stream is stream
-        assert wrapper._stream_wrapper is result
 
 
 def test_sync_manager_does_not_create_invocation_until_enter():
@@ -342,84 +384,6 @@ def test_sync_manager_does_not_create_invocation_until_enter():
         pass
 
     assert factory_calls == [True]
-
-
-def test_sync_manager_enter_fails_invocation_when_manager_raises():
-    error = RuntimeError("manager enter failure")
-    failures = []
-    invocation = _make_invocation()
-    invocation.fail = failures.append
-    wrapper = MessagesStreamManagerWrapper(
-        manager=_FakeSyncManager(
-            stream=SimpleNamespace(),
-            enter_error=error,
-        ),
-        invocation_factory=lambda: invocation,
-        capture_content=False,
-    )
-
-    with pytest.raises(RuntimeError, match="manager enter failure"):
-        with wrapper:
-            pass
-
-    assert failures == [error]
-
-
-def test_sync_manager_exit_forwards_exception_to_stream_wrapper():
-    wrapper = MessagesStreamManagerWrapper(
-        manager=_FakeSyncManager(stream=SimpleNamespace(), suppressed=False),
-        invocation_factory=_make_invocation,
-        capture_content=False,
-    )
-    stream_wrapper = _FakeStreamWrapper()
-    wrapper._stream_wrapper = stream_wrapper
-
-    error = ValueError("boom")
-    result = wrapper.__exit__(ValueError, error, None)
-
-    assert result is False
-    assert wrapper._manager.exit_args == (ValueError, error, None)
-    assert stream_wrapper.exit_args == (ValueError, error, None)
-
-
-def test_sync_manager_exit_uses_none_exception_when_manager_suppresses():
-    wrapper = MessagesStreamManagerWrapper(
-        manager=_FakeSyncManager(stream=SimpleNamespace(), suppressed=True),
-        invocation_factory=_make_invocation,
-        capture_content=False,
-    )
-    stream_wrapper = _FakeStreamWrapper()
-    wrapper._stream_wrapper = stream_wrapper
-
-    error = RuntimeError("ignored")
-    result = wrapper.__exit__(RuntimeError, error, None)
-
-    assert result is True
-    assert wrapper._manager.exit_args == (RuntimeError, error, None)
-    assert stream_wrapper.exit_args == (None, None, None)
-
-
-def test_sync_manager_exit_still_finalizes_stream_wrapper_when_manager_raises():
-    manager_error = RuntimeError("manager failure")
-    wrapper = MessagesStreamManagerWrapper(
-        manager=_FakeSyncManager(
-            stream=SimpleNamespace(),
-            suppressed=False,
-            exit_error=manager_error,
-        ),
-        invocation_factory=_make_invocation,
-        capture_content=False,
-    )
-    stream_wrapper = _FakeStreamWrapper()
-    wrapper._stream_wrapper = stream_wrapper
-
-    error = ValueError("outer")
-    with pytest.raises(RuntimeError, match="manager failure"):
-        wrapper.__exit__(ValueError, error, None)
-
-    assert wrapper._manager.exit_args == (ValueError, error, None)
-    assert stream_wrapper.exit_args[:2] == (RuntimeError, manager_error)
-    assert stream_wrapper.exit_args[2] is not None
 
 
 @pytest.mark.asyncio
@@ -572,93 +536,240 @@ async def test_async_manager_enter_constructs_async_stream_wrapper():
     stream = _FakeAsyncStream()
     wrapper = AsyncMessagesStreamManagerWrapper(
         manager=_FakeAsyncManager(stream=stream),
-        invocation=_make_invocation(),
+        invocation_factory=_make_invocation,
         capture_content=False,
     )
 
     async with wrapper as result:
         assert isinstance(result, AsyncMessagesStreamWrapper)
         assert result.stream is stream
-        assert wrapper._stream_wrapper is result
+
+
+def test_stream_wrapper_accumulate_event_failure_logs_warning_and_disables(
+    monkeypatch, caplog
+):
+    import logging
+
+    from opentelemetry.instrumentation.genai.anthropic import wrappers
+
+    monkeypatch.setattr(wrappers, "_accumulation_disabled", False)
+
+    calls = []
+
+    def mock_accumulate(**kwargs):
+        calls.append(kwargs)
+        raise TypeError("Unexpected argument in new SDK version")
+
+    monkeypatch.setattr(wrappers, "accumulate_event", mock_accumulate)
+
+    stream = _FakeSyncStream(events=["chunk1", "chunk2"])
+    wrapper = _make_stream_wrapper(stream)
+
+    with caplog.at_level(logging.WARNING):
+        list(wrapper)
+
+    assert len(calls) == 1
+    assert wrappers._accumulation_disabled is True
+    assert (
+        "Failed to accumulate streaming content; this Anthropic SDK version is not supported."
+        in caplog.text
+    )
+
+
+def test_stream_wrapper_passes_json_bufs_when_supported(monkeypatch):
+    from opentelemetry.instrumentation.genai.anthropic import wrappers
+
+    monkeypatch.setattr(wrappers, "_accumulation_disabled", False)
+    monkeypatch.setattr(wrappers, "_accumulate_takes_json_bufs", True)
+
+    captured_kwargs = []
+
+    def mock_accumulate(**kwargs):
+        captured_kwargs.append(kwargs)
+        return SimpleNamespace(
+            model="claude-test",
+            id="msg_1",
+            usage=None,
+            content=[],
+            stop_reason=None,
+        )
+
+    monkeypatch.setattr(wrappers, "accumulate_event", mock_accumulate)
+
+    stream = _FakeSyncStream(events=["chunk1"])
+    wrapper = _make_stream_wrapper(stream)
+
+    list(wrapper)
+
+    assert len(captured_kwargs) == 1
+    assert "json_bufs" in captured_kwargs[0]
+    assert captured_kwargs[0]["json_bufs"] is wrapper._self_json_bufs
+
+
+def test_stream_wrapper_does_not_pass_json_bufs_when_unsupported(monkeypatch):
+    from opentelemetry.instrumentation.genai.anthropic import wrappers
+
+    monkeypatch.setattr(wrappers, "_accumulation_disabled", False)
+    monkeypatch.setattr(wrappers, "_accumulate_takes_json_bufs", False)
+
+    captured_kwargs = []
+
+    def mock_accumulate(**kwargs):
+        captured_kwargs.append(kwargs)
+        return SimpleNamespace(
+            model="claude-test",
+            id="msg_1",
+            usage=None,
+            content=[],
+            stop_reason=None,
+        )
+
+    monkeypatch.setattr(wrappers, "accumulate_event", mock_accumulate)
+
+    stream = _FakeSyncStream(events=["chunk1"])
+    wrapper = _make_stream_wrapper(stream)
+
+    list(wrapper)
+
+    assert len(captured_kwargs) == 1
+    assert "json_bufs" not in captured_kwargs[0]
 
 
 @pytest.mark.asyncio
-async def test_async_manager_enter_fails_invocation_when_manager_raises():
-    error = RuntimeError("manager enter failure")
-    failures = []
-    invocation = _make_invocation()
-    invocation.fail = failures.append
-    wrapper = AsyncMessagesStreamManagerWrapper(
-        manager=_FakeAsyncManager(
-            stream=SimpleNamespace(),
-            enter_error=error,
-        ),
-        invocation=invocation,
-        capture_content=False,
-    )
+async def test_async_stream_wrapper_accumulate_event_failure_logs_warning_and_disables(
+    monkeypatch, caplog
+):
+    import logging
 
-    with pytest.raises(RuntimeError, match="manager enter failure"):
-        async with wrapper:
+    from opentelemetry.instrumentation.genai.anthropic import wrappers
+
+    monkeypatch.setattr(wrappers, "_accumulation_disabled", False)
+
+    calls = []
+
+    def mock_accumulate(**kwargs):
+        calls.append(kwargs)
+        raise TypeError("Unexpected argument in new SDK version")
+
+    monkeypatch.setattr(wrappers, "accumulate_event", mock_accumulate)
+
+    stream = _FakeAsyncStream(events=["chunk1", "chunk2"])
+    wrapper = _make_async_stream_wrapper(stream)
+
+    with caplog.at_level(logging.WARNING):
+        async for _ in wrapper:
             pass
 
-    assert failures == [error]
+    assert len(calls) == 1
+    assert wrappers._accumulation_disabled is True
+    assert (
+        "Failed to accumulate streaming content; this Anthropic SDK version is not supported."
+        in caplog.text
+    )
+
+
+def test_stream_wrapper_reraises_non_exception(monkeypatch):
+    from opentelemetry.instrumentation.genai.anthropic import wrappers
+
+    monkeypatch.setattr(wrappers, "_accumulation_disabled", False)
+
+    def mock_accumulate(**kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(wrappers, "accumulate_event", mock_accumulate)
+
+    stream = _FakeSyncStream(events=["chunk1"])
+    wrapper = _make_stream_wrapper(stream)
+
+    with pytest.raises(KeyboardInterrupt):
+        list(wrapper)
+
+    assert wrappers._accumulation_disabled is True
 
 
 @pytest.mark.asyncio
-async def test_async_manager_exit_forwards_exception_to_stream_wrapper():
-    wrapper = AsyncMessagesStreamManagerWrapper(
-        manager=_FakeAsyncManager(stream=SimpleNamespace(), suppressed=False),
-        invocation=_make_invocation(),
-        capture_content=False,
-    )
-    stream_wrapper = _FakeAsyncStreamWrapper()
-    wrapper._stream_wrapper = stream_wrapper
+async def test_async_stream_wrapper_reraises_non_exception(monkeypatch):
+    from opentelemetry.instrumentation.genai.anthropic import wrappers
 
-    error = ValueError("boom")
-    result = await wrapper.__aexit__(ValueError, error, None)
+    monkeypatch.setattr(wrappers, "_accumulation_disabled", False)
 
-    assert result is False
-    assert wrapper._manager.exit_args == (ValueError, error, None)
-    assert stream_wrapper.exit_args == (ValueError, error, None)
+    def mock_accumulate(**kwargs):
+        raise KeyboardInterrupt()
 
+    monkeypatch.setattr(wrappers, "accumulate_event", mock_accumulate)
 
-@pytest.mark.asyncio
-async def test_async_manager_exit_uses_none_exception_when_manager_suppresses():
-    wrapper = AsyncMessagesStreamManagerWrapper(
-        manager=_FakeAsyncManager(stream=SimpleNamespace(), suppressed=True),
-        invocation=_make_invocation(),
-        capture_content=False,
-    )
-    stream_wrapper = _FakeAsyncStreamWrapper()
-    wrapper._stream_wrapper = stream_wrapper
+    stream = _FakeAsyncStream(events=["chunk1"])
+    wrapper = _make_async_stream_wrapper(stream)
 
-    error = RuntimeError("ignored")
-    result = await wrapper.__aexit__(RuntimeError, error, None)
+    with pytest.raises(KeyboardInterrupt):
+        async for _ in wrapper:
+            pass
 
-    assert result is True
-    assert wrapper._manager.exit_args == (RuntimeError, error, None)
-    assert stream_wrapper.exit_args == (None, None, None)
+    assert wrappers._accumulation_disabled is True
 
 
 @pytest.mark.asyncio
-async def test_async_manager_exit_still_finalizes_stream_wrapper_when_manager_raises():
-    manager_error = RuntimeError("manager failure")
-    wrapper = AsyncMessagesStreamManagerWrapper(
-        manager=_FakeAsyncManager(
-            stream=SimpleNamespace(),
-            suppressed=False,
-            exit_error=manager_error,
-        ),
-        invocation=_make_invocation(),
-        capture_content=False,
-    )
-    stream_wrapper = _FakeAsyncStreamWrapper()
-    wrapper._stream_wrapper = stream_wrapper
+async def test_async_stream_wrapper_passes_json_bufs_when_supported(
+    monkeypatch,
+):
+    from opentelemetry.instrumentation.genai.anthropic import wrappers
 
-    error = ValueError("outer")
-    with pytest.raises(RuntimeError, match="manager failure"):
-        await wrapper.__aexit__(ValueError, error, None)
+    monkeypatch.setattr(wrappers, "_accumulation_disabled", False)
+    monkeypatch.setattr(wrappers, "_accumulate_takes_json_bufs", True)
 
-    assert wrapper._manager.exit_args == (ValueError, error, None)
-    assert stream_wrapper.exit_args[:2] == (RuntimeError, manager_error)
-    assert stream_wrapper.exit_args[2] is not None
+    captured_kwargs = []
+
+    def mock_accumulate(**kwargs):
+        captured_kwargs.append(kwargs)
+        return SimpleNamespace(
+            model="claude-test",
+            id="msg_1",
+            usage=None,
+            content=[],
+            stop_reason=None,
+        )
+
+    monkeypatch.setattr(wrappers, "accumulate_event", mock_accumulate)
+
+    stream = _FakeAsyncStream(events=["chunk1"])
+    wrapper = _make_async_stream_wrapper(stream)
+
+    async for _ in wrapper:
+        pass
+
+    assert len(captured_kwargs) == 1
+    assert "json_bufs" in captured_kwargs[0]
+    assert captured_kwargs[0]["json_bufs"] is wrapper._self_json_bufs
+
+
+@pytest.mark.asyncio
+async def test_async_stream_wrapper_does_not_pass_json_bufs_when_unsupported(
+    monkeypatch,
+):
+    from opentelemetry.instrumentation.genai.anthropic import wrappers
+
+    monkeypatch.setattr(wrappers, "_accumulation_disabled", False)
+    monkeypatch.setattr(wrappers, "_accumulate_takes_json_bufs", False)
+
+    captured_kwargs = []
+
+    def mock_accumulate(**kwargs):
+        captured_kwargs.append(kwargs)
+        return SimpleNamespace(
+            model="claude-test",
+            id="msg_1",
+            usage=None,
+            content=[],
+            stop_reason=None,
+        )
+
+    monkeypatch.setattr(wrappers, "accumulate_event", mock_accumulate)
+
+    stream = _FakeAsyncStream(events=["chunk1"])
+    wrapper = _make_async_stream_wrapper(stream)
+
+    async for _ in wrapper:
+        pass
+
+    assert len(captured_kwargs) == 1
+    assert "json_bufs" not in captured_kwargs[0]

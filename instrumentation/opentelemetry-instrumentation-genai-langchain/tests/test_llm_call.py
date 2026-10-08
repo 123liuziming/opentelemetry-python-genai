@@ -1,19 +1,32 @@
 # Copyright The OpenTelemetry Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import asyncio
+import json
 from importlib.metadata import version as _pkg_version
 from typing import Optional
 
 import pytest
 from langchain_anthropic import ChatAnthropic
+from langchain_core.language_models.fake_chat_models import (
+    FakeMessagesListChatModel,
+)
 from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
     FunctionMessage,
     HumanMessage,
     SystemMessage,
+    SystemMessageChunk,
 )
+from langchain_core.outputs import ChatGenerationChunk
 from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
 from openai import AuthenticationError
 
+from opentelemetry.instrumentation.genai.langchain import (
+    LangChainInstrumentor,
+)
 from opentelemetry.instrumentation.genai.langchain.utils import (
     to_input_messages,
 )
@@ -24,6 +37,8 @@ from opentelemetry.semconv._incubating.attributes import (
 from opentelemetry.semconv._incubating.attributes import gen_ai_attributes
 from opentelemetry.semconv._incubating.metrics import gen_ai_metrics
 from opentelemetry.semconv.attributes import error_attributes
+from opentelemetry.test_util_genai.instrumentor import instrument
+from opentelemetry.util.genai.types import TextPart
 
 
 def _openai_cassette_name(model, base: str) -> str:
@@ -55,6 +70,16 @@ def _langchain_openai_version() -> tuple:
 # older releases drop the detail entirely, so the reasoning assertions below
 # cannot hold on those versions.
 _supports_reasoning_token_details = _langchain_openai_version() >= (0, 2, 1)
+_supports_responses_api = _langchain_openai_version() >= (1, 3, 0)
+
+_REAL_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAADAAAAAwCAIAAADYYG7QAAAARklEQVR42u3X"
+    "QQ0AIAwAsSnZG4lInJxJwMRICGlyAvq9yF1PFUBAQEBAQBdAXWskICAgICAg"
+    "ICAgICAgIOcKBAQEBPQd6ACUHHNEU5qggAAAAABJRU5ErkJggg=="
+)
+
+# An Anthropic Files API image reference. Pinned to the recorded cassette.
+_ANTHROPIC_FILE_ID = "file_011CNhaGCM5eyZmDsFmQJVQe"
 
 
 # span_exporter, metric_reader, log_exporter, start_instrumentation, chat_openai_gpt_3_5_turbo_model are coming from fixtures defined in conftest.py
@@ -66,28 +91,32 @@ def test_chat_openai_gpt_3_5_turbo_model_llm_call(
     span_exporter,
     metric_reader,
     log_exporter,
-    start_instrumentation,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
     chat_openai_gpt_3_5_turbo_model,
-    monkeypatch,
     capture_content,
     vcr,
 ):
-    monkeypatch.setenv(
-        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", capture_content
-    )
-
     messages = [
         SystemMessage(content="You are a helpful assistant!"),
         HumanMessage(content="What is the capital of France?"),
     ]
 
-    with vcr.use_cassette(
-        _openai_cassette_name(
-            chat_openai_gpt_3_5_turbo_model,
-            "test_chat_openai_gpt_3_5_turbo_model_llm_call",
-        )
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+        content_capture=capture_content,
     ):
-        response = chat_openai_gpt_3_5_turbo_model.invoke(messages)
+        with vcr.use_cassette(
+            _openai_cassette_name(
+                chat_openai_gpt_3_5_turbo_model,
+                "test_chat_openai_gpt_3_5_turbo_model_llm_call",
+            )
+        ):
+            response = chat_openai_gpt_3_5_turbo_model.invoke(messages)
     assert response.content == "The capital of France is Paris."
 
     # verify spans
@@ -136,33 +165,39 @@ def test_chat_openai_gpt_3_5_turbo_model_llm_call_with_error(
     span_exporter,
     metric_reader,
     log_exporter,
-    start_instrumentation,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
     chat_openai_gpt_3_5_turbo_model,
-    monkeypatch,
     capture_content,
     vcr,
 ):
-    monkeypatch.setenv(
-        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", capture_content
-    )
-
     messages = [
         SystemMessage(content="You are a helpful assistant!"),
         HumanMessage(content="What is the capital of France?"),
     ]
 
     response = None
-    try:
-        with vcr.use_cassette(
-            _openai_cassette_name(
-                chat_openai_gpt_3_5_turbo_model,
-                "test_chat_openai_gpt_3_5_turbo_model_llm_call_with_error",
-            )
-        ):
-            response = chat_openai_gpt_3_5_turbo_model.invoke(messages)
-    except Exception as e:
-        # For this test, to get error, cassettes were recorded with no OPENAI_API_KEY, so an error is expected here.
-        assert isinstance(e, AuthenticationError)
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+        content_capture=capture_content,
+    ):
+        try:
+            with vcr.use_cassette(
+                _openai_cassette_name(
+                    chat_openai_gpt_3_5_turbo_model,
+                    "test_chat_openai_gpt_3_5_turbo_model_llm_call_with_error",
+                )
+            ):
+                response = chat_openai_gpt_3_5_turbo_model.invoke(messages)
+        except Exception as e:
+            # For this test, to get error, cassettes were recorded with no OPENAI_API_KEY, so an error is expected here.
+            assert isinstance(e, AuthenticationError)
+            # langchain-openai >= 1.6 raises its own AuthenticationError subclass.
+            error_type = f"{type(e).__module__}.{type(e).__qualname__}"
 
     assert response is None
 
@@ -173,7 +208,9 @@ def test_chat_openai_gpt_3_5_turbo_model_llm_call_with_error(
         True if capture_content in ("SPAN_ONLY", "SPAN_AND_EVENT") else False
     )
     assert_openai_completion_attributes_with_error(
-        spans[0] if len(spans) > 0 else None, verify_content=verify_content
+        spans[0] if len(spans) > 0 else None,
+        error_type,
+        verify_content=verify_content,
     )
 
     # verify metrics
@@ -194,6 +231,134 @@ def test_chat_openai_gpt_3_5_turbo_model_llm_call_with_error(
         assert_log_record_when_error(log_record, spans[0])
     elif capture_content in ("SPAN_ONLY", "NO_CONTENT"):
         assert len(logs) == 0
+
+
+def test_chat_openai_multimodal_image_llm_call(
+    span_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+    chat_openai_vision,
+    vcr,
+):
+    """End-to-end: an OpenAI ``image_url`` content block is captured as an
+    image ``Blob`` part in ``gen_ai.input.messages``."""
+    messages = [
+        HumanMessage(
+            content=[
+                {"type": "text", "text": "What is in this image?"},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{_REAL_PNG_B64}"
+                    },
+                },
+            ]
+        ),
+    ]
+
+    payload = chat_openai_vision._get_request_payload(messages, stop=None)
+    if "n" in payload:
+        pytest.skip(
+            "langchain-openai < 1.0 sends a different request body "
+            "(explicit n/temperature); only the modern cassette is recorded"
+        )
+
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+        content_capture="SPAN_ONLY",
+    ):
+        with vcr.use_cassette(
+            "test_chat_openai_multimodal_image_llm_call.yaml"
+        ):
+            chat_openai_vision.invoke(messages)
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    span = spans[0]
+
+    assert span.attributes.get(gen_ai_attributes.GEN_AI_REQUEST_MODEL) == (
+        "gpt-4o"
+    )
+
+    input_message = span.attributes.get(
+        gen_ai_attributes.GEN_AI_INPUT_MESSAGES
+    )
+    assert input_message is not None
+    assert '"role":"user"' in input_message
+    assert '"type":"text"' in input_message
+    assert '"content":"What is in this image?"' in input_message
+    assert '"type":"blob"' in input_message
+    assert '"modality":"image"' in input_message
+    assert '"mime_type":"image/png"' in input_message
+    assert _REAL_PNG_B64 in input_message
+
+
+def test_chat_openai_standard_image_block_llm_call(
+    span_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+    chat_openai_vision,
+    vcr,
+):
+    """End-to-end: a LangChain standard ``image`` block is captured as an
+    image ``Blob`` part in ``gen_ai.input.messages``."""
+    messages = [
+        HumanMessage(
+            content=[
+                {"type": "text", "text": "What is in this image?"},
+                {
+                    "type": "image",
+                    "base64": _REAL_PNG_B64,
+                    "mime_type": "image/png",
+                },
+            ]
+        ),
+    ]
+
+    # langchain-openai renders a standard block to the same ``image_url`` body
+    # as the native shape, so this shares that cassette.
+    payload = chat_openai_vision._get_request_payload(messages, stop=None)
+    if "n" in payload or not any(
+        isinstance(block, dict) and block.get("type") == "image_url"
+        for block in payload["messages"][0].get("content", [])
+    ):
+        pytest.skip(
+            "langchain-openai < 1.0 does not render standard image blocks "
+            "to the recorded request body"
+        )
+
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+        content_capture="SPAN_ONLY",
+    ):
+        with vcr.use_cassette(
+            "test_chat_openai_multimodal_image_llm_call.yaml"
+        ):
+            chat_openai_vision.invoke(messages)
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert (
+        spans[0].attributes.get(gen_ai_attributes.GEN_AI_RESPONSE_MODEL)
+        == "gpt-4o-2024-11-20"
+    )
+
+    input_message = spans[0].attributes.get(
+        gen_ai_attributes.GEN_AI_INPUT_MESSAGES
+    )
+    assert input_message is not None
+    assert '"type":"blob"' in input_message
+    assert '"modality":"image"' in input_message
+    assert '"mime_type":"image/png"' in input_message
+    assert _REAL_PNG_B64 in input_message
 
 
 # span_exporter, start_instrumentation, us_amazon_nova_lite_v1_0 are coming from fixtures defined in conftest.py
@@ -291,15 +456,12 @@ def test_chat_anthropic_claude_sonnet_tool_call(
 
 def test_chat_openai_legacy_function_call(
     span_exporter,
-    start_instrumentation,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
     chat_openai_legacy_functions,
-    monkeypatch,
     vcr,
 ):
-    monkeypatch.setenv(
-        "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "SPAN_ONLY"
-    )
-
     functions = [
         {
             "name": "get_current_weather",
@@ -334,10 +496,17 @@ def test_chat_openai_legacy_function_call(
     payload = chat_openai_legacy_functions._get_request_payload([], stop=None)
     cassette_suffix = "_old" if "n" in payload else ""
 
-    with vcr.use_cassette(
-        f"test_chat_openai_legacy_function_call{cassette_suffix}"
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+        content_capture="SPAN_ONLY",
     ):
-        llm_with_functions.invoke(messages)
+        with vcr.use_cassette(
+            f"test_chat_openai_legacy_function_call{cassette_suffix}"
+        ):
+            llm_with_functions.invoke(messages)
 
     spans = span_exporter.get_finished_spans()
     assert len(spans) == 1
@@ -372,6 +541,207 @@ def test_chat_openai_legacy_function_call(
     assert '"location"' in tool_definitions
 
 
+@pytest.mark.vcr()
+def test_chat_anthropic_multimodal_image_llm_call(
+    span_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+    chat_anthropic_claude_sonnet,
+):
+    """End-to-end: an Anthropic ``image`` content block is captured as an
+    image ``Blob`` part in ``gen_ai.input.messages``."""
+    messages = [
+        HumanMessage(
+            content=[
+                {"type": "text", "text": "What is in this image?"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": _REAL_PNG_B64,
+                    },
+                },
+            ]
+        ),
+    ]
+
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+        content_capture="SPAN_ONLY",
+    ):
+        chat_anthropic_claude_sonnet.invoke(messages)
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    span = spans[0]
+
+    assert span.attributes.get(gen_ai_attributes.GEN_AI_REQUEST_MODEL) == (
+        "claude-sonnet-4-5"
+    )
+
+    input_message = span.attributes.get(
+        gen_ai_attributes.GEN_AI_INPUT_MESSAGES
+    )
+    assert input_message is not None
+    assert '"role":"user"' in input_message
+    assert '"type":"text"' in input_message
+    assert '"content":"What is in this image?"' in input_message
+    assert '"type":"blob"' in input_message
+    assert '"modality":"image"' in input_message
+    assert '"mime_type":"image/png"' in input_message
+    assert _REAL_PNG_B64 in input_message
+
+
+@pytest.mark.vcr()
+def test_chat_anthropic_file_ref_image_llm_call(
+    span_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+    chat_anthropic_claude_sonnet,
+):
+    """End-to-end: a provider-hosted Anthropic image is captured as a ``file``
+    part carrying the file id, rather than dropped."""
+    messages = [
+        HumanMessage(
+            content=[
+                {"type": "text", "text": "What is in this image?"},
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "file",
+                        "file_id": _ANTHROPIC_FILE_ID,
+                    },
+                },
+            ]
+        ),
+    ]
+
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+        content_capture="SPAN_ONLY",
+    ):
+        chat_anthropic_claude_sonnet.invoke(messages)
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+
+    input_message = spans[0].attributes.get(
+        gen_ai_attributes.GEN_AI_INPUT_MESSAGES
+    )
+    assert input_message is not None
+    assert '"content":"What is in this image?"' in input_message
+    assert '"type":"file"' in input_message
+    assert '"modality":"image"' in input_message
+    assert f'"file_id":"{_ANTHROPIC_FILE_ID}"' in input_message
+
+
+@pytest.mark.skipif(
+    not _supports_responses_api,
+    reason="langchain-openai < 1.3 does not support the Responses API",
+)
+def test_chat_openai_responses_api_input_image_llm_call(
+    span_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+    chat_openai_responses_vision,
+    vcr,
+):
+    """End-to-end: Responses API ``input_text``/``input_image`` blocks, which
+    langchain-openai forwards verbatim, are captured as text and blob parts."""
+    messages = [
+        HumanMessage(
+            content=[
+                {"type": "input_text", "text": "What is in this image?"},
+                {
+                    "type": "input_image",
+                    "image_url": f"data:image/png;base64,{_REAL_PNG_B64}",
+                },
+            ]
+        ),
+    ]
+
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+        content_capture="SPAN_ONLY",
+    ):
+        with vcr.use_cassette(
+            "test_chat_openai_responses_input_image_llm_call.yaml"
+        ):
+            chat_openai_responses_vision.invoke(messages)
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+
+    input_message = spans[0].attributes.get(
+        gen_ai_attributes.GEN_AI_INPUT_MESSAGES
+    )
+    assert input_message is not None
+    assert '"content":"What is in this image?"' in input_message
+    assert '"type":"blob"' in input_message
+    assert '"modality":"image"' in input_message
+    assert '"mime_type":"image/png"' in input_message
+    assert _REAL_PNG_B64 in input_message
+
+
+def test_chat_openai_legacy_function_call_no_content_omits_tool_definitions(
+    span_exporter,
+    start_instrumentation,
+    chat_openai_legacy_functions,
+    vcr,
+):
+    functions = [
+        {
+            "name": "get_current_weather",
+            "description": "Get the current weather in a given location.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City name",
+                    },
+                },
+                "required": ["location"],
+            },
+        }
+    ]
+    llm_with_functions = chat_openai_legacy_functions.bind(
+        functions=functions,
+        function_call={"name": "get_current_weather"},
+    )
+
+    messages = [
+        SystemMessage(content="You are a helpful assistant!"),
+        HumanMessage(content="What is the weather in Paris?"),
+    ]
+
+    payload = chat_openai_legacy_functions._get_request_payload([], stop=None)
+    cassette_suffix = "_old" if "n" in payload else ""
+
+    with vcr.use_cassette(
+        f"test_chat_openai_legacy_function_call{cassette_suffix}"
+    ):
+        llm_with_functions.invoke(messages)
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    span = spans[0]
+    assert gen_ai_attributes.GEN_AI_TOOL_DEFINITIONS not in span.attributes
+
+
 # span_exporter, start_instrumentation, gemini are coming from fixtures defined in conftest.py
 def test_gemini(span_exporter, start_instrumentation, gemini, vcr):
     messages = [
@@ -400,6 +770,188 @@ def test_function_message_role_maps_to_tool():
     )
     assert len(result) == 1
     assert result[0].role == "tool"
+
+
+def test_system_message_role_maps_to_system():
+    result = to_input_messages(
+        [
+            SystemMessage(content="You are helpful."),
+            HumanMessage(content="Hi"),
+        ]
+    )
+    assert len(result) == 2
+    assert result[0].role == "system"
+    assert result[0].parts == [TextPart(content="You are helpful.")]
+    assert result[1].role == "user"
+
+
+def test_system_message_handles_system_message_chunk():
+    result = to_input_messages(
+        [
+            SystemMessageChunk(content="Streamed system prompt."),
+            HumanMessage(content="Hi"),
+        ]
+    )
+    assert len(result) == 2
+    assert result[0].role == "system"
+    assert result[0].parts == [TextPart(content="Streamed system prompt.")]
+    assert result[1].role == "user"
+
+
+def test_to_input_messages_preserves_name():
+    inputs = to_input_messages(
+        [
+            HumanMessage(content="Hi", name="Alice"),
+            AIMessage(content="Hello", name="Bob"),
+        ]
+    )
+    assert inputs[0].name == "Alice"
+    assert inputs[1].name == "Bob"
+
+
+def test_chat_model_preserves_input_and_output_message_names(
+    span_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+):
+    class _TestModel(FakeMessagesListChatModel):
+        model_name: str = "test-model"
+
+        @property
+        def _identifying_params(self):
+            return {"model_name": self.model_name}
+
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+        content_capture="SPAN_ONLY",
+    ):
+        model = _TestModel(
+            responses=[AIMessage(content="Hello there!", name="assistant_bob")]
+        )
+        model.invoke([HumanMessage(content="Hi!", name="user_alice")])
+
+    (span,) = span_exporter.get_finished_spans()
+    input_messages = json.loads(
+        span.attributes[gen_ai_attributes.GEN_AI_INPUT_MESSAGES]
+    )
+    output_messages = json.loads(
+        span.attributes[gen_ai_attributes.GEN_AI_OUTPUT_MESSAGES]
+    )
+
+    assert len(input_messages) == 1
+    assert input_messages[0]["name"] == "user_alice"
+    assert input_messages[0]["role"] == "user"
+
+    assert len(output_messages) == 1
+    assert output_messages[0]["name"] == "assistant_bob"
+    assert output_messages[0]["role"] == "assistant"
+
+    assert gen_ai_attributes.GEN_AI_REQUEST_TOP_K not in span.attributes
+    assert gen_ai_attributes.GEN_AI_REQUEST_CHOICE_COUNT not in span.attributes
+
+
+@pytest.mark.skipif(
+    _langchain_openai_version() < (1, 0, 0),
+    reason="cassette was recorded with langchain-openai 1.x",
+)
+def test_chat_openai_captures_choice_count(
+    span_exporter,
+    log_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+    vcr,
+):
+    model = ChatOpenAI(
+        model="gpt-5.1",
+        api_key="test_openai_api_key",
+        n=3,
+    )
+
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+        content_capture="SPAN_AND_EVENT",
+    ):
+        with vcr.use_cassette("test_chat_openai_captures_choice_count.yaml"):
+            model.invoke([HumanMessage(content="Reply with one short word.")])
+
+    (span,) = span_exporter.get_finished_spans()
+    assert span.attributes[gen_ai_attributes.GEN_AI_REQUEST_CHOICE_COUNT] == 3
+
+    (log,) = log_exporter.get_finished_logs()
+    assert (
+        log.log_record.attributes[
+            gen_ai_attributes.GEN_AI_REQUEST_CHOICE_COUNT
+        ]
+        == 3
+    )
+
+
+@pytest.mark.vcr()
+def test_chat_anthropic_captures_top_k(
+    span_exporter,
+    log_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+):
+    model = ChatAnthropic(
+        model="claude-sonnet-4-5",
+        api_key="test_key",
+        max_tokens=32,
+        top_k=40,
+    )
+
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+        content_capture="SPAN_AND_EVENT",
+    ):
+        model.invoke([HumanMessage(content="Reply with one short word.")])
+
+    (span,) = span_exporter.get_finished_spans()
+    assert span.attributes[gen_ai_attributes.GEN_AI_REQUEST_TOP_K] == 40
+
+    (log,) = log_exporter.get_finished_logs()
+    assert (
+        log.log_record.attributes[gen_ai_attributes.GEN_AI_REQUEST_TOP_K] == 40
+    )
+
+
+def test_chat_model_uses_ls_model_name_from_metadata(
+    span_exporter,
+    tracer_provider,
+    meter_provider,
+    logger_provider,
+):
+    with instrument(
+        LangChainInstrumentor(),
+        tracer_provider=tracer_provider,
+        meter_provider=meter_provider,
+        logger_provider=logger_provider,
+    ):
+        model = FakeMessagesListChatModel(
+            responses=[AIMessage(content="Hello")]
+        )
+        model.invoke(
+            [HumanMessage(content="Hi")],
+            config={"metadata": {"ls_model_name": "custom-chat-model"}},
+        )
+
+    (span,) = span_exporter.get_finished_spans()
+    assert (
+        span.attributes[gen_ai_attributes.GEN_AI_REQUEST_MODEL]
+        == "custom-chat-model"
+    )
 
 
 def assert_openai_completion_attributes(
@@ -479,17 +1031,16 @@ def assert_openai_completion_attributes(
     else:
         assert gen_ai_attributes.GEN_AI_INPUT_MESSAGES not in attributes
         assert gen_ai_attributes.GEN_AI_OUTPUT_MESSAGES not in attributes
+    assert gen_ai_attributes.GEN_AI_SYSTEM_INSTRUCTIONS not in attributes
 
 
 def assert_openai_completion_attributes_with_error(
-    span: ReadableSpan, verify_content: bool = True
+    span: ReadableSpan, error_type: str, verify_content: bool = True
 ):
     assert span is not None
     assert span.name == "chat gpt-3.5-turbo"
     attributes = span.attributes
-    assert (
-        attributes[error_attributes.ERROR_TYPE] == "openai.AuthenticationError"
-    )
+    assert attributes[error_attributes.ERROR_TYPE] == error_type
     assert attributes[gen_ai_attributes.GEN_AI_OPERATION_NAME] == "chat"
     assert (
         attributes[gen_ai_attributes.GEN_AI_REQUEST_MODEL] == "gpt-3.5-turbo"
@@ -527,6 +1078,7 @@ def assert_openai_completion_attributes_with_error(
     else:
         assert gen_ai_attributes.GEN_AI_INPUT_MESSAGES not in attributes
         assert gen_ai_attributes.GEN_AI_OUTPUT_MESSAGES not in attributes
+    assert gen_ai_attributes.GEN_AI_SYSTEM_INSTRUCTIONS not in attributes
 
 
 def assert_bedrock_completion_attributes(
@@ -651,7 +1203,8 @@ def assert_duration_metric_when_error(metric, parent_span):
 def assert_duration_metric_attributes_when_error(attributes, parent_span):
     assert len(attributes) == 4
     assert (
-        attributes[error_attributes.ERROR_TYPE] == "openai.AuthenticationError"
+        attributes[error_attributes.ERROR_TYPE]
+        == parent_span.attributes[error_attributes.ERROR_TYPE]
     )
     assert attributes.get(gen_ai_attributes.GEN_AI_PROVIDER_NAME) == "openai"
     assert (
@@ -784,6 +1337,8 @@ def assert_log_record(log_record, parent_span, response=None):
         assert got["role"] == exp["role"]
         assert _normalize_to_list(got["parts"]) == exp["parts"]
 
+    assert gen_ai_attributes.GEN_AI_SYSTEM_INSTRUCTIONS not in attrs
+
     output_msgs = _normalize_to_list(
         attrs.get(gen_ai_attributes.GEN_AI_OUTPUT_MESSAGES, [])
     )
@@ -848,6 +1403,7 @@ def assert_log_record_when_error(log_record, parent_span):
         assert got["role"] == exp["role"]
         assert _normalize_to_list(got["parts"]) == exp["parts"]
 
+    assert gen_ai_attributes.GEN_AI_SYSTEM_INSTRUCTIONS not in attrs
     assert gen_ai_attributes.GEN_AI_OUTPUT_MESSAGES not in attrs
     assert_log_parent(log_record, parent_span)
 
@@ -971,12 +1527,7 @@ def test_chat_anthropic_claude_sonnet_cache_token_details(
     assert len(spans) == 1
     span = spans[0]
 
-    assert (
-        span.attributes.get(
-            gen_ai_attributes.GEN_AI_USAGE_CACHE_CREATION_INPUT_TOKENS
-        )
-        == 5
-    )
+    assert span.attributes.get("gen_ai.usage.cache_write.input_tokens") == 5
 
     assert (
         span.attributes.get(
@@ -987,4 +1538,91 @@ def test_chat_anthropic_claude_sonnet_cache_token_details(
 
     assert (
         span.attributes.get(gen_ai_attributes.GEN_AI_USAGE_INPUT_TOKENS) == 22
+    )
+
+
+def test_chat_openai_streamed_response_model(
+    span_exporter,
+    start_instrumentation,
+    chat_openai_gpt_3_5_turbo_model,
+    monkeypatch,
+):
+    """A streamed call reports the response model.
+
+    Driving a real ``.stream()`` matters here: the model is reported only in
+    ``generation_info``, and it is LangChain that copies that into the
+    message's ``response_metadata`` where the instrumentation reads it. A
+    hand-built ``LLMResult`` would skip that copy and prove nothing.
+
+    The provider stream is patched rather than replayed from a cassette: what
+    is under test is the shape LangChain hands to ``on_llm_end`` for a streamed
+    call — merged chunks with no ``llm_output`` — which is the same either way.
+    """
+
+    def fake_stream(self, messages, stop=None, run_manager=None, **kwargs):
+        yield ChatGenerationChunk(message=AIMessageChunk(content="Paris"))
+        # langchain-openai reports the model only on the chunk that also
+        # carries the finish reason.
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(content=""),
+            generation_info={
+                "finish_reason": "stop",
+                "model_name": "gpt-3.5-turbo-0125",
+            },
+        )
+
+    monkeypatch.setattr(ChatOpenAI, "_stream", fake_stream)
+
+    chunks = list(
+        chat_openai_gpt_3_5_turbo_model.stream(
+            [HumanMessage(content="What is the capital of France?")]
+        )
+    )
+    assert "".join(chunk.content for chunk in chunks) == "Paris"
+
+    (span,) = span_exporter.get_finished_spans()
+    assert (
+        span.attributes.get(gen_ai_attributes.GEN_AI_RESPONSE_MODEL)
+        == "gpt-3.5-turbo-0125"
+    )
+    assert span.attributes.get(gen_ai_attributes.GEN_AI_RESPONSE_ID) is None
+
+
+def test_chat_openai_astreamed_response_model(
+    span_exporter,
+    start_instrumentation,
+    chat_openai_gpt_3_5_turbo_model,
+    monkeypatch,
+):
+    """``.astream()`` reports the response model, as ``.stream()`` does."""
+
+    async def fake_astream(
+        self, messages, stop=None, run_manager=None, **kwargs
+    ):
+        yield ChatGenerationChunk(message=AIMessageChunk(content="Paris"))
+        yield ChatGenerationChunk(
+            message=AIMessageChunk(content=""),
+            generation_info={
+                "finish_reason": "stop",
+                "model_name": "gpt-3.5-turbo-0125",
+            },
+        )
+
+    monkeypatch.setattr(ChatOpenAI, "_astream", fake_astream)
+
+    async def drain():
+        return [
+            chunk
+            async for chunk in chat_openai_gpt_3_5_turbo_model.astream(
+                [HumanMessage(content="What is the capital of France?")]
+            )
+        ]
+
+    chunks = asyncio.run(drain())
+    assert "".join(chunk.content for chunk in chunks) == "Paris"
+
+    (span,) = span_exporter.get_finished_spans()
+    assert (
+        span.attributes.get(gen_ai_attributes.GEN_AI_RESPONSE_MODEL)
+        == "gpt-3.5-turbo-0125"
     )

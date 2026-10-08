@@ -11,9 +11,20 @@ This library traces user turns handled by `QwenPaw
 application built on AgentScope. Each turn that goes through
 ``AgentRunner.query_handler`` produces one ``invoke_agent`` span following
 the OpenTelemetry GenAI semantic conventions, carrying the agent display
-name (``gen_ai.agent.name``, on versions that expose it), the session id
+name (``gen_ai.agent.name``, when already cached by the runner), the session id
 (``gen_ai.conversation.id``), and — when content capture is enabled — the
 turn's input and output messages.
+
+The span remains open until the response stream is drained or closed.
+Successful finalization records ``gen_ai.response.finish_reasons`` when the
+last emitted assistant message is complete. Closing a partial message
+preserves captured output without reporting a finish reason. Local agent
+turns record the ``gen_ai.invoke_agent.duration`` metric.
+
+With ``opentelemetry-util-genai`` 1.2b0, callers must drain or explicitly close
+the stream to end its span. Finalization of abandoned streams requires the
+shared utility fix tracked in `issue #386
+<https://github.com/open-telemetry/opentelemetry-python-genai/issues/386>`_.
 
 QwenPaw delegates model (LLM) and tool execution to AgentScope, so this
 package emits no ``chat`` or ``execute_tool`` spans and its conformance

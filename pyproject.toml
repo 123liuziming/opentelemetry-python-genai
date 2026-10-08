@@ -13,8 +13,10 @@ dependencies = [
   "opentelemetry-util-genai",
   "opentelemetry-instrumentation-genai-agno[instruments]",
   "opentelemetry-instrumentation-genai-anthropic[instruments]",
+  "opentelemetry-instrumentation-genai-bedrock[instruments]",
   "opentelemetry-instrumentation-genai-claude-agent-sdk[instruments]",
   "opentelemetry-instrumentation-genai-crewai[instruments]",
+  "opentelemetry-instrumentation-genai-dspy[instruments]",
   "opentelemetry-instrumentation-google-genai[instruments]",
   "opentelemetry-instrumentation-genai-langchain[instruments]",
   "opentelemetry-instrumentation-genai-llama-index[instruments]",
@@ -36,16 +38,9 @@ required-version = ">=0.6.0"
 # workspace's ~=1.43 floor. Override crewai's caps so the workspace lock
 # resolves against the versions the util packages require. This is the
 # lock-time analog of the conformance-only UV_OVERRIDE wired in tox.ini.
-# crewai also caps chromadb at ~=1.1.0, which can't coexist with qwenpaw's
-# (via reme-ai) chromadb >= 1.3.5 floor; and qwenpaw (via agentscope-runtime
-# -> oss2 -> aliyun-python-sdk-core) caps jmespath below 1.0, which can't
-# coexist with crewai's (via cel-python) jmespath >= 1.0.1 floor. Relax both
-# caps so the two extras resolve in the same workspace lock.
 override-dependencies = [
   "opentelemetry-api ~= 1.43",
   "opentelemetry-sdk ~= 1.43",
-  "chromadb >= 1.3.5",
-  "jmespath >= 1.0.1",
 ]
 
 # https://docs.astral.sh/uv/reference/settings/#sources
@@ -54,8 +49,10 @@ opentelemetry-test-util-genai = { workspace = true }
 opentelemetry-util-genai = { workspace = true }
 opentelemetry-instrumentation-genai-agno = { workspace = true }
 opentelemetry-instrumentation-genai-anthropic = { workspace = true }
+opentelemetry-instrumentation-genai-bedrock = { workspace = true }
 opentelemetry-instrumentation-genai-claude-agent-sdk = { workspace = true }
 opentelemetry-instrumentation-genai-crewai = { workspace = true }
+opentelemetry-instrumentation-genai-dspy = { workspace = true }
 opentelemetry-instrumentation-google-genai = { workspace = true }
 opentelemetry-instrumentation-genai-langchain = { workspace = true }
 opentelemetry-instrumentation-genai-llama-index = { workspace = true }
@@ -125,11 +122,14 @@ reportDeprecated = false  # Ignore deprecation on GenAI enums in opentelemetry.s
 include = [
   "instrumentation/opentelemetry-instrumentation-genai-agno",
   "instrumentation/opentelemetry-instrumentation-genai-anthropic",
+  "instrumentation/opentelemetry-instrumentation-genai-bedrock",
   "instrumentation/opentelemetry-instrumentation-genai-claude-agent-sdk",
   "instrumentation/opentelemetry-instrumentation-genai-crewai",
+  "instrumentation/opentelemetry-instrumentation-genai-dspy",
   "instrumentation/opentelemetry-instrumentation-genai-langchain",
   "instrumentation/opentelemetry-instrumentation-genai-llama-index",
   "instrumentation/opentelemetry-instrumentation-genai-openai-agents",
+  "instrumentation/opentelemetry-instrumentation-genai-portkey",
   "instrumentation/opentelemetry-instrumentation-genai-qwen-agent",
   "instrumentation/opentelemetry-instrumentation-genai-qwenpaw",
   "instrumentation/opentelemetry-instrumentation-genai-weaviate-client",
@@ -144,16 +144,22 @@ exclude = [
   "instrumentation/opentelemetry-instrumentation-genai-agno/examples/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-anthropic/tests/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-anthropic/examples/**/*.py",
+  "instrumentation/opentelemetry-instrumentation-genai-bedrock/tests/**/*.py",
+  "instrumentation/opentelemetry-instrumentation-genai-bedrock/examples/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-claude-agent-sdk/tests/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-claude-agent-sdk/examples/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-crewai/tests/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-crewai/examples/**/*.py",
+  "instrumentation/opentelemetry-instrumentation-genai-dspy/tests/**/*.py",
+  "instrumentation/opentelemetry-instrumentation-genai-dspy/examples/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-langchain/tests/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-langchain/examples/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-llama-index/tests/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-llama-index/examples/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-openai-agents/tests/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-openai-agents/examples/**",
+  "instrumentation/opentelemetry-instrumentation-genai-portkey/tests/**/*.py",
+  "instrumentation/opentelemetry-instrumentation-genai-portkey/examples/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-qwen-agent/tests/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-qwen-agent/examples/**/*.py",
   "instrumentation/opentelemetry-instrumentation-genai-qwenpaw/tests/**/*.py",

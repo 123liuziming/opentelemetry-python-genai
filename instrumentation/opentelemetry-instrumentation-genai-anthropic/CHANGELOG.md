@@ -15,6 +15,74 @@ See https://github.com/open-telemetry/opentelemetry-python-genai/blob/main/CONTR
 
 <!-- changelog start -->
 
+## Version 1.2b0 (2026-09-24)
+
+### Added
+
+- Capture Anthropic image and document inputs as GenAI ``BlobPart``,
+  ``UriPart``, ``FilePart``, and ``GenericPart`` message parts
+  ([#589](https://github.com/open-telemetry/opentelemetry-python-genai/pull/589))
+
+### Changed
+
+- Bump the minimum `opentelemetry-util-genai` version to 1.2b0.
+  ([#365](https://github.com/open-telemetry/opentelemetry-python-genai/pull/365))
+
+### Fixed
+
+- preserve caller exceptions when closing Anthropic streaming responses
+  ([#397](https://github.com/open-telemetry/opentelemetry-python-genai/pull/397))
+- Capture Anthropic sampling parameters passed through ``extra_body``.
+  ([#480](https://github.com/open-telemetry/opentelemetry-python-genai/pull/480))
+- Emit telemetry under the `opentelemetry.instrumentation.genai.anthropic`
+  instrumentation scope instead of `opentelemetry.util.genai.handler`
+  ([#632](https://github.com/open-telemetry/opentelemetry-python-genai/pull/632))
+- Record ``gen_ai.tool.definitions`` from the ``tools`` request parameter.
+  ([#652](https://github.com/open-telemetry/opentelemetry-python-genai/pull/652))
+- Record response telemetry on ``messages.stream()`` when the stream is
+  consumed through ``text_stream``, ``get_final_message()``,
+  ``get_final_text()`` or ``until_done()``, which previously produced a span
+  with request attributes only.
+  ([#654](https://github.com/open-telemetry/opentelemetry-python-genai/pull/654))
+- Record failed Anthropic invocations when cancellation raises a
+  `BaseException`.
+  ([#656](https://github.com/open-telemetry/opentelemetry-python-genai/pull/656))
+- Fix streaming message accumulation with ``anthropic>=1.5.0`` and gracefully
+  suppress future accumulation on signature mismatches.
+  ([#672](https://github.com/open-telemetry/opentelemetry-python-genai/pull/672))
+- Represent Anthropic server tool calls and results with server tool message
+  parts.
+  ([#699](https://github.com/open-telemetry/opentelemetry-python-genai/pull/699))
+
+## Version 1.1b1 (2026-08-21)
+
+### Changed
+
+- Support Anthropic 1.x, which uses ``httpx2`` as its HTTP client.
+  ([#435](https://github.com/open-telemetry/opentelemetry-python-genai/pull/435))
+
+## Version 1.1b0 (2026-08-20)
+
+### Added
+
+- Emit streaming timing metrics (time-to-first-chunk and time-per-output-chunk)
+  for streaming messages.
+  ([#269](https://github.com/open-telemetry/opentelemetry-python-genai/pull/269))
+- Forward the configured ``CompletionHook``
+  (``OTEL_INSTRUMENTATION_GENAI_COMPLETION_HOOK`` or the
+  ``instrument(completion_hook=...)`` argument) to the telemetry handler.
+  ([#302](https://github.com/open-telemetry/opentelemetry-python-genai/pull/302))
+
+### Fixed
+
+- Stop raising ``AttributeError`` into the caller when ``Messages.create`` is
+  invoked through ``with_raw_response``; the raw response is returned untouched
+  and telemetry is extracted from the parsed message. Streaming
+  ``with_raw_response``/``with_streaming_response`` results are now wrapped in
+  a deferred proxy so the span is finalized when the parsed stream is drained
+  instead of being ended prematurely with no response attributes.
+  ([#381](https://github.com/open-telemetry/opentelemetry-python-genai/pull/381))
+
 ## Version 1.0b0 (2026-07-09)
 
 ### Added

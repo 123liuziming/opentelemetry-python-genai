@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from typing import (
@@ -36,21 +36,18 @@ class ContentCapturingMode(Enum):
 
 @dataclass()
 class GenericPart:
-    """Used for provider-specific message part types that don't match
-    the standard MessagePart types defined in semantic conventions. Set ``type``
-    to the provider-specific type discriminator and carry the payload in
-    ``value`` to explicitly opt-in to non-standard types.
-    This will be removed in a future version when all instrumentations use core types.
+    """Represents an arbitrary message part with any type and properties.
+    This allows for extensibility with custom message part types.
 
-    Per the semconv message schema, ``type`` is a free-form string (the
-    provider's own type name), not a fixed literal."""
+    This model is specified as part of semconv in `GenAI messages Python models - GenericPart
+    <https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/non-normative/models.py>`__.
+    """
 
     type: str
-    value: Any
 
 
 @dataclass()
-class ToolCallRequest:
+class ToolCallRequestPart:
     """Represents a tool call requested by the model (message part only).
 
     Use this for tool calls in message history. For execution tracking with spans
@@ -67,7 +64,7 @@ class ToolCallRequest:
 
 
 @dataclass()
-class ToolCallResponse:
+class ToolCallResponsePart:
     """Represents a tool call result sent to the model or a built-in tool call outcome and details
 
     This model is specified as part of semconv in `GenAI messages Python models - ToolCallResponsePart
@@ -80,7 +77,7 @@ class ToolCallResponse:
 
 
 @dataclass()
-class ServerToolCall:
+class ServerToolCallPart:
     """Represents a server-side tool call.
 
     Server tool calls are executed by the model provider on the server side rather
@@ -98,7 +95,7 @@ class ServerToolCall:
 
 
 @dataclass()
-class ServerToolCallResponse:
+class ServerToolCallResponsePart:
     """Represents a server-side tool call response.
 
     Contains the outcome and details of a server tool execution. Provider-specific
@@ -115,7 +112,7 @@ class ServerToolCallResponse:
 
 
 @dataclass()
-class Text:
+class TextPart:
     """Represents text content sent to or received from the model
 
     This model is specified as part of semconv in `GenAI messages Python models - TextPart
@@ -127,7 +124,7 @@ class Text:
 
 
 @dataclass()
-class Reasoning:
+class ReasoningPart:
     """Represents reasoning/thinking content received from the model
 
     This model is specified as part of semconv in `GenAI messages Python models - ReasoningPart
@@ -157,11 +154,37 @@ class CompactionPart:
     type: Literal["compaction"] = "compaction"
 
 
-Modality = Literal["image", "video", "audio", "document"]
+class Modality(str, Enum):
+    """Well-known content and token modalities.
+
+    Based on the `GenAI messages Python models - Modality
+    <https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/non-normative/models.py>`__.
+    Token setters record only ``TEXT``, ``IMAGE``, and ``AUDIO``; other
+    modalities are ignored. Message parts accept all members and plain
+    strings for provider-specific modalities.
+    """
+
+    TEXT = "text"
+    IMAGE = "image"
+    VIDEO = "video"
+    AUDIO = "audio"
+    DOCUMENT = "document"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+ModalityTokens: TypeAlias = Iterable[tuple[Modality | str, int | None]]
+"""A per-modality token breakdown, as ``(modality, token count)`` pairs.
+
+The modality may be a plain string or an enum member carrying one as its
+``value``, so a provider SDK's own enum can be passed straight through.
+Token setters record only text, image, and audio; other modalities are ignored.
+"""
 
 
 @dataclass()
-class Blob:
+class BlobPart:
     """Represents blob binary data sent inline to the model
 
     This model is specified as part of semconv in `GenAI messages Python models - BlobPart
@@ -175,7 +198,7 @@ class Blob:
 
 
 @dataclass()
-class File:
+class FilePart:
     """Represents an external referenced file sent to the model by file id
 
     This model is specified as part of semconv in `GenAI messages Python models - FilePart
@@ -189,7 +212,7 @@ class File:
 
 
 @dataclass()
-class Uri:
+class UriPart:
     """Represents an external referenced file sent to the model by URI
 
     This model is specified as part of semconv in `GenAI messages Python models - UriPart
@@ -200,6 +223,64 @@ class Uri:
     modality: Modality | str
     uri: str
     type: Literal["uri"] = "uri"
+
+
+# Deprecated names for the message part classes, kept for backwards compatibility.
+# Delete this block once the deprecation period ends.
+
+ToolCallRequest = ToolCallRequestPart
+"""
+.. deprecated:: 1.2b0
+    Alias of :class:`ToolCallRequestPart`, kept for backwards compatibility.
+"""
+
+ToolCallResponse = ToolCallResponsePart
+"""
+.. deprecated:: 1.2b0
+    Alias of :class:`ToolCallResponsePart`, kept for backwards compatibility.
+"""
+
+ServerToolCall = ServerToolCallPart
+"""
+.. deprecated:: 1.2b0
+    Alias of :class:`ServerToolCallPart`, kept for backwards compatibility.
+"""
+
+ServerToolCallResponse = ServerToolCallResponsePart
+"""
+.. deprecated:: 1.2b0
+    Alias of :class:`ServerToolCallResponsePart`, kept for backwards compatibility.
+"""
+
+Text = TextPart
+"""
+.. deprecated:: 1.2b0
+    Alias of :class:`TextPart`, kept for backwards compatibility.
+"""
+
+Reasoning = ReasoningPart
+"""
+.. deprecated:: 1.2b0
+    Alias of :class:`ReasoningPart`, kept for backwards compatibility.
+"""
+
+Blob = BlobPart
+"""
+.. deprecated:: 1.2b0
+    Alias of :class:`BlobPart`, kept for backwards compatibility.
+"""
+
+File = FilePart
+"""
+.. deprecated:: 1.2b0
+    Alias of :class:`FilePart`, kept for backwards compatibility.
+"""
+
+Uri = UriPart
+"""
+.. deprecated:: 1.2b0
+    Alias of :class:`UriPart`, kept for backwards compatibility.
+"""
 
 
 @dataclass()
@@ -223,36 +304,62 @@ class GenericToolDefinition:
 ToolDefinition = Union[FunctionToolDefinition, GenericToolDefinition]
 
 MessagePart = Union[
-    Text,
-    ToolCallRequest,
-    ToolCallResponse,
-    ServerToolCall,
-    ServerToolCallResponse,
-    Blob,
-    File,
-    Uri,
-    Reasoning,
+    TextPart,
+    ToolCallRequestPart,
+    ToolCallResponsePart,
+    ServerToolCallPart,
+    ServerToolCallResponsePart,
+    BlobPart,
+    FilePart,
+    UriPart,
+    ReasoningPart,
     CompactionPart,
     GenericPart,  # For provider-specific types; prefer standard types above
 ]
 
 
 FinishReason = Literal[
-    "content_filter", "error", "length", "stop", "tool_calls", "compaction"
+    "content_filter", "error", "length", "stop", "tool_call", "compaction"
 ]
+
+
+# Semconv schemas: model/gen-ai/gen-ai-{input,output}-messages.json (pinned by SEMCONV_GENAI_REF).
+class Role(str, Enum):
+    SYSTEM = "system"
+    USER = "user"
+    ASSISTANT = "assistant"
+    TOOL = "tool"
+
+
+SystemInstructionPart = Union[TextPart, GenericPart]
 
 
 @dataclass()
 class InputMessage:
     role: str
     parts: list[MessagePart]
+    name: str | None = None
 
 
 @dataclass()
 class OutputMessage:
     role: str
     parts: list[MessagePart]
-    finish_reason: str | FinishReason
+    finish_reason: str | FinishReason | None = None
+    """Deprecated. Report finish reasons in ``gen_ai.response.finish_reasons`` instead."""
+    name: str | None = None
+
+
+@dataclass()
+class RetrievalDocument:
+    """Represents a document retrieved from a vector database or search system.
+
+    Mirrors the `GenAI retrieval Python model - RetrievalDocument
+    <https://github.com/open-telemetry/semantic-conventions-genai/blob/main/docs/gen-ai/non-normative/models.py>`__.
+    """
+
+    id: str | None = None
+    score: float | None = None
 
 
 # Callback an instrumentor may supply to derive the error.type attribute from a
@@ -284,6 +391,8 @@ class Error:
         )
 
         error_type = type_resolver(exception) if type_resolver else None
+        if error_type is None and hasattr(exception, "_gen_ai_error_type"):
+            error_type = getattr(exception, "_gen_ai_error_type")
         return cls(
             message=str(exception),
             type=error_type or fq_exception_type(exception),

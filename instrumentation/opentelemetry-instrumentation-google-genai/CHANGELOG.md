@@ -15,6 +15,82 @@ See https://github.com/open-telemetry/opentelemetry-python-genai/blob/main/CONTR
 
 <!-- changelog start -->
 
+## Version 1.2b0 (2026-09-24)
+
+### Added
+
+- Record modality token usage breakdown attributes (text, image, audio) for
+  interactions.
+  ([#613](https://github.com/open-telemetry/opentelemetry-python-genai/pull/613))
+- Record modality token usage breakdown attributes (text, image, audio) for
+  generate_content.
+  ([#674](https://github.com/open-telemetry/opentelemetry-python-genai/pull/674))
+- Record `gen_ai.client.operation.time_to_first_chunk` and
+  `gen_ai.client.operation.time_per_output_chunk` metrics on streamed
+  responses.
+  ([#711](https://github.com/open-telemetry/opentelemetry-python-genai/pull/711))
+- Capture generation configuration and output format attributes for
+  synchronous, asynchronous, and streaming Interactions requests.
+  ([#752](https://github.com/open-telemetry/opentelemetry-python-genai/pull/752))
+- Add `fetch_response` spans for Google GenAI `interactions.get`, including
+  streamed and resumed retrieval.
+  ([#755](https://github.com/open-telemetry/opentelemetry-python-genai/pull/755))
+
+### Changed
+
+- Bump the minimum `opentelemetry-util-genai` version to 1.2b0.
+  ([#365](https://github.com/open-telemetry/opentelemetry-python-genai/pull/365))
+- Tool definitions are not emitted when content capture is disabled
+  ([#377](https://github.com/open-telemetry/opentelemetry-python-genai/pull/377))
+
+### Fixed
+
+- Record failed Google Interactions streaming requests instead of leaving their
+  spans open.
+  ([#538](https://github.com/open-telemetry/opentelemetry-python-genai/pull/538))
+- Emit telemetry under the `opentelemetry.instrumentation.google_genai`
+  instrumentation scope instead of `opentelemetry.util.genai.handler`
+  ([#632](https://github.com/open-telemetry/opentelemetry-python-genai/pull/632))
+- Record failed Google GenAI interaction invocations when cancellation raises a
+  `BaseException`.
+  ([#656](https://github.com/open-telemetry/opentelemetry-python-genai/pull/656))
+- Capture provider-executed tool calls and results as server tool message
+  parts.
+  ([#701](https://github.com/open-telemetry/opentelemetry-python-genai/pull/701))
+- Do not record `gen_ai.embeddings.dimension.count` on metrics.
+  ([#708](https://github.com/open-telemetry/opentelemetry-python-genai/pull/708))
+
+## Version 1.1b1 (2026-08-21)
+
+### Changed
+
+- Raised `opentelemetry-util-genai` dependency floor to 1.1b0.
+  ([#433](https://github.com/open-telemetry/opentelemetry-python-genai/pull/433))
+
+## Version 1.1b0 (2026-08-20)
+
+### Added
+
+- Add response.id semantic convention attribute to interactions telemetry.
+  ([#233](https://github.com/open-telemetry/opentelemetry-python-genai/pull/233))
+- Add tool definitions attribute to interactions API spans/events. Use invoke
+  remote agent span instead of inference span when an agent is specified.
+  ([#271](https://github.com/open-telemetry/opentelemetry-python-genai/pull/271))
+- Surface the HTTP status code (e.g. ``429``) as ``error.type`` on failed
+  ``generate_content`` and ``interactions.create`` inference spans and metrics,
+  instead of collapsing every ``google.genai`` error into ``ClientError`` /
+  ``ServerError``.
+  ([#304](https://github.com/open-telemetry/opentelemetry-python-genai/pull/304))
+
+### Fixed
+
+- Include reasoning/thinking tokens in `gen_ai.usage.output_tokens` on both the
+  span and the token-usage metric (candidates_token_count excludes thoughts).
+  ([#283](https://github.com/open-telemetry/opentelemetry-python-genai/pull/283))
+- Finalize the span successfully when an async `generate_content_stream` is
+  closed before being drained, instead of recording it as an error
+  ([#390](https://github.com/open-telemetry/opentelemetry-python-genai/pull/390))
+
 ## Version 1.0b1 (2026-07-13)
 
 ### Added

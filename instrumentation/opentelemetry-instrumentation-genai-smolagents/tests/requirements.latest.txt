@@ -26,7 +26,11 @@
 # This variant of the requirements aims to test the system using the newest
 # supported version of external dependencies.
 
-smolagents
+# The instrumented model classes run inference in this process and the tests stub
+# their runtimes. openai is the model backend the VCR agent test runs against; it
+# is test-only, so pyproject.toml does not declare it.
+smolagents[openai]~=1.26.0
+wrapt>=2.4.1
 
 -e util/opentelemetry-util-genai
 -e instrumentation/opentelemetry-instrumentation-genai-smolagents

@@ -7,7 +7,7 @@ OpenTelemetry SDK and instrumentations manually in an embedding process.
 When `main.py <main.py>`_ is run, it starts the QwenPaw app in-process and
 exports traces, logs, and metrics to an OTLP compatible endpoint. Every user
 turn handled by the agent runner produces an ``invoke_agent`` span carrying
-the agent id, agent name, and session id. Pair it with the AgentScope
+the cached agent name and session id. Pair it with the AgentScope
 instrumentation to also capture the model and tool calls QwenPaw delegates.
 
 `custom_hook.py <custom_hook.py>`_ shows the same setup with a custom

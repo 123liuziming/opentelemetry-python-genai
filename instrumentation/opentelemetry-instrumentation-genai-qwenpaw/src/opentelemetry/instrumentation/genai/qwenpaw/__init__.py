@@ -62,6 +62,7 @@ from opentelemetry.util.genai.handler import TelemetryHandler
 
 from .package import _instruments
 from .patch import make_query_handler_wrapper
+from .version import __version__
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,8 @@ class QwenPawInstrumentor(BaseInstrumentor):
                   over the one configured by environment variable
         """
         handler = TelemetryHandler(
+            instrumentation_scope_name=__package__,
+            instrumentation_scope_version=__version__,
             tracer_provider=kwargs.get("tracer_provider"),
             meter_provider=kwargs.get("meter_provider"),
             logger_provider=kwargs.get("logger_provider"),

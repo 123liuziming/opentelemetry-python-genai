@@ -5,9 +5,13 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import cast
 
-from opentelemetry.util.genai.types import InputMessage, OutputMessage, Text
+from opentelemetry.util.genai.types import (
+    InputMessage,
+    OutputMessage,
+    TextPart,
+)
 
 
 def non_empty_str(value: object) -> str | None:
@@ -19,8 +23,8 @@ def non_empty_str(value: object) -> str | None:
 
 
 def parse_query_handler_call(
-    args: tuple[Any, ...],
-    kwargs: dict[str, Any],
+    args: tuple[object, ...],
+    kwargs: dict[str, object],
 ) -> tuple[object, object]:
     """Return ``(msgs, request)`` from ``query_handler`` positional/kwargs."""
     msgs: object = None
@@ -60,7 +64,9 @@ def input_messages_from_msgs(msgs: object) -> list[InputMessage]:
         if text is None:
             continue
         role = non_empty_str(getattr(msg, "role", None)) or "user"
-        messages.append(InputMessage(role=role, parts=[Text(content=text)]))
+        messages.append(
+            InputMessage(role=role, parts=[TextPart(content=text)])
+        )
     return messages
 
 
@@ -78,6 +84,5 @@ def output_message_from_yield_item(item: object) -> OutputMessage | None:
         return None
     return OutputMessage(
         role="assistant",
-        parts=[Text(content=text)],
-        finish_reason="stop",
+        parts=[TextPart(content=text)],
     )

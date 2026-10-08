@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import timeit
 from abc import abstractmethod
-from collections.abc import Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from contextvars import Token
 from dataclasses import asdict
 from types import TracebackType
-from typing import TYPE_CHECKING, Any, TypeAlias
+from typing import Any, TypeAlias, cast
+
+from typing_extensions import Self
 
 from opentelemetry._logs import Logger, LogRecord
 from opentelemetry.context import Context, attach, detach
@@ -18,16 +20,24 @@ from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAI,
 )
 from opentelemetry.semconv.attributes import error_attributes
-from opentelemetry.trace import INVALID_SPAN as _INVALID_SPAN
 from opentelemetry.trace import Span, SpanKind, Tracer, set_span_in_context
 from opentelemetry.trace.status import Status, StatusCode
-from opentelemetry.util.genai.completion_hook import CompletionHook
+from opentelemetry.util.genai._conversation_context import (
+    get_ambient_conversation_id,
+    with_conversation_id,
+)
+from opentelemetry.util.genai._instruments import _Instruments
+from opentelemetry.util.genai.completion_hook import (
+    CompletionHook,
+    _NoOpCompletionHook,
+)
 from opentelemetry.util.genai.types import (
     Error,
     ErrorTypeResolver,
     InputMessage,
     MessagePart,
     OutputMessage,
+    SystemInstructionPart,
     ToolDefinition,
 )
 from opentelemetry.util.genai.utils import (
@@ -37,8 +47,7 @@ from opentelemetry.util.genai.utils import (
 )
 from opentelemetry.util.types import AttributeValue
 
-if TYPE_CHECKING:
-    from opentelemetry.util.genai.metrics import InvocationMetricsRecorder
+_GEN_AI_PROMPT_VARIABLE_PREFIX: str = "gen_ai.prompt.variable."
 
 
 ContextToken: TypeAlias = Token[Context]
@@ -58,7 +67,7 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
         # Individual components instead of TelemetryHandler to avoid a circular
         # import between handler.py and the invocation modules.
         tracer: Tracer,
-        metrics_recorder: InvocationMetricsRecorder,
+        instruments: _Instruments,
         logger: Logger,
         completion_hook: CompletionHook,
         operation_name: str,
@@ -67,13 +76,24 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
         attributes: dict[str, AttributeValue] | None = None,
         metric_attributes: dict[str, AttributeValue] | None = None,
         error_type_resolver: ErrorTypeResolver | None = None,
+        *,
+        start_attributes: dict[str, AttributeValue] | None = None,
+        context: Context | None = None,
+        _attach_to_context: bool = True,
+        conversation_id: str | None = None,
+        content_capturing_mode: ContentCapturingMode | None = None,
     ) -> None:
         self._tracer = tracer
-        self._metrics_recorder = metrics_recorder
+        self._instruments: _Instruments = instruments
         self._logger = logger
         self._completion_hook = completion_hook
         self._error_type_resolver = error_type_resolver
         self._operation_name: str = operation_name
+        self._content_capturing_mode: ContentCapturingMode = (
+            get_content_capturing_mode()
+            if content_capturing_mode is None
+            else content_capturing_mode
+        )
         self.attributes: dict[str, AttributeValue] = (
             {} if attributes is None else attributes
         )
@@ -82,12 +102,32 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
             {} if metric_attributes is None else metric_attributes
         )
         """Additional attributes to set on metrics. Must be low cardinality. Not set on spans or events."""
-        self.span: Span = _INVALID_SPAN
-        self._span_context: Context
-        self._span_name: str = span_name
-        self._span_kind: SpanKind = span_kind
-        self._context_token: ContextToken | None = None
-        self._monotonic_start_s: float
+        self.conversation_id: str | None = (
+            conversation_id
+            if conversation_id is not None
+            else get_ambient_conversation_id(context)
+        )
+        """Emitted as ``gen_ai.conversation.id`` by the operations semconv
+        defines it on: inference, invoke_agent, invoke_workflow."""
+        if self.conversation_id:
+            context = with_conversation_id(
+                self.conversation_id, context=context
+            )
+        self._start_attributes: dict[str, AttributeValue] = {
+            GenAI.GEN_AI_OPERATION_NAME: operation_name,
+            **(start_attributes or {}),
+        }
+        self.span: Span = self._tracer.start_span(
+            name=span_name,
+            kind=span_kind,
+            attributes=self._start_attributes,
+            context=context,
+        )
+        self._span_context: Context = set_span_in_context(self.span, context)
+        self._context_token: ContextToken | None = (
+            attach(self._span_context) if _attach_to_context else None
+        )
+        self._monotonic_start_s: float = timeit.default_timer()
         # Streaming state, set when the invocation is handed to a stream
         # wrapper. ``_request_stream`` marks the request as streamed
         # (gen_ai.request.stream); the timing fields are populated by
@@ -95,23 +135,55 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
         self._request_stream: bool | None = None
         self._ttfc_seconds: float | None = None
         self._stream_last_chunk_at: float | None = None
+        self._finished: bool = False
 
-    def _start(
-        self, attributes: dict[str, AttributeValue] | None = None
-    ) -> None:
-        """Start the invocation span and attach it to the current context.
+    @property
+    def should_capture_content(self) -> bool:
+        """Return True when message content should be captured for this invocation."""
+        return self._content_capturing_mode in (
+            ContentCapturingMode.SPAN_ONLY,
+            ContentCapturingMode.EVENT_ONLY,
+            ContentCapturingMode.SPAN_AND_EVENT,
+        ) or not isinstance(self._completion_hook, _NoOpCompletionHook)
 
-        Args:
-            attributes: Initial span attributes available for sampling decisions.
-        """
-        self.span = self._tracer.start_span(
-            name=self._span_name,
-            kind=self._span_kind,
-            attributes=attributes,
+    @property
+    def _should_capture_content_on_span(self) -> bool:
+        return self._content_capturing_mode in (
+            ContentCapturingMode.SPAN_ONLY,
+            ContentCapturingMode.SPAN_AND_EVENT,
         )
-        self._span_context = set_span_in_context(self.span)
-        self._monotonic_start_s = timeit.default_timer()
-        self._context_token = attach(self._span_context)
+
+    @property
+    def context(self) -> Context:
+        """The OpenTelemetry Context containing this invocation's span."""
+        return self._span_context
+
+    def suspend(self) -> None:
+        """Restore the context that was current before this invocation started.
+
+        Call this when handing control back to the caller while the invocation
+        is still running -- returning a stream the caller has not drained yet,
+        for example -- so unrelated caller work is not parented under this
+        invocation's span. Idempotent, and pairs with ``activate``.
+        """
+        token, self._context_token = self._context_token, None
+        if token is not None:
+            detach(token)
+
+    @contextmanager
+    def activate(self) -> Iterator[None]:
+        """Make this invocation's span the current span inside the block.
+
+        Restores the previous context on exit. A no-op once the invocation has finished.
+        """
+        if self._finished:
+            yield
+            return
+        token = attach(self.context)
+        try:
+            yield
+        finally:
+            detach(token)
 
     def _get_metric_attributes(self) -> dict[str, AttributeValue]:
         """Return low-cardinality attributes for metric recording."""
@@ -120,6 +192,13 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
     def _get_metric_token_counts(self) -> dict[str, int]:  # pylint: disable=no-self-use
         """Return {token_type: count} for token histogram recording."""
         return {}
+
+    def record_stream_chunk(self) -> None:
+        """Mark the request as streamed and record one output chunk arriving."""
+        if self._finished:
+            return
+        self._request_stream = True
+        self._on_stream_chunk(timeit.default_timer())
 
     def _on_stream_chunk(self, chunk_at: float) -> None:
         """Record streaming timing for one output chunk as it arrives.
@@ -140,17 +219,40 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
         attributes = self._get_metric_attributes()
         if self._ttfc_seconds is None:
             self._ttfc_seconds = delta
-            self._metrics_recorder.record_time_to_first_chunk(
+            self._instruments.time_to_first_chunk.record(
                 delta,
                 attributes=attributes,
                 context=self._span_context,
             )
         else:
-            self._metrics_recorder.record_time_per_chunk(
+            self._instruments.time_per_output_chunk.record(
                 delta,
                 attributes=attributes,
                 context=self._span_context,
             )
+
+    def _record_client_metrics(self) -> None:
+        """Record gen_ai.client.operation.duration and gen_ai.client.token.usage."""
+        attributes = self._get_metric_attributes()
+        duration_seconds = max(
+            timeit.default_timer() - self._monotonic_start_s,
+            0.0,
+        )
+        self._instruments.operation_duration.record(
+            duration_seconds,
+            attributes=attributes,
+            context=self._span_context,
+        )
+
+        token_counts = self._get_metric_token_counts()
+        if token_counts:
+            for token_type, token_count in token_counts.items():
+                self._instruments.token_usage.record(
+                    token_count,
+                    attributes=attributes
+                    | {GenAI.GEN_AI_TOKEN_TYPE: token_type},
+                    context=self._span_context,
+                )
 
     def _apply_error_attributes(self, error: Error) -> None:
         """Apply error status and error.type attribute to the span, events, and metrics."""
@@ -163,7 +265,9 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
         *,
         inputs: list[InputMessage] | None = None,
         outputs: list[OutputMessage] | None = None,
-        system_instruction: list[MessagePart] | None = None,
+        system_instruction: list[SystemInstructionPart]
+        | list[MessagePart]
+        | None = None,
         tool_definitions: list[ToolDefinition] | None = None,
         log_record: LogRecord | None = None,
     ) -> None:
@@ -175,7 +279,9 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
         self._completion_hook.on_completion(
             inputs=inputs or [],
             outputs=outputs or [],
-            system_instruction=system_instruction or [],
+            system_instruction=cast(
+                "list[MessagePart]", system_instruction or []
+            ),
             tool_definitions=tool_definitions,
             span=self.span,
             log_record=log_record,
@@ -187,18 +293,15 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
 
     def _finish(self, error: Error | None = None) -> None:
         """Apply finish telemetry and end the span. Finishes at most once."""
-        if self._context_token is None:
+        if self._finished:
             return
-        # Clear up front so a nested or repeated finish is a no-op even if
+        # Set up front so a nested or repeated finish is a no-op even if
         # _apply_finish raises.
-        context_token, self._context_token = self._context_token, None
+        self._finished = True
         try:
             self._apply_finish(error)
         finally:
-            try:
-                detach(context_token)
-            except Exception:  # pylint: disable=broad-except
-                pass
+            self.suspend()
             self.span.end()
 
     def stop(self) -> None:
@@ -211,7 +314,7 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
             error = Error.from_exception(error, self._error_type_resolver)
         self._finish(error)
 
-    def __enter__(self) -> GenAIInvocation:
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(
@@ -220,7 +323,7 @@ class GenAIInvocation(AbstractContextManager["GenAIInvocation"]):
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        if exc_value is not None and isinstance(exc_value, Exception):
+        if exc_value is not None:
             self.fail(exc_value)
         else:
             self.stop()
@@ -230,21 +333,31 @@ def get_content_attributes(
     *,
     input_messages: Sequence[InputMessage],
     output_messages: Sequence[OutputMessage],
-    system_instruction: Sequence[MessagePart],
+    system_instruction: Sequence[SystemInstructionPart | MessagePart],
     tool_definitions: Sequence[ToolDefinition] | None,
+    prompt_variables: Mapping[str, object] | None = None,
     for_span: bool,
+    content_capturing_mode: ContentCapturingMode | None = None,
 ) -> dict[str, Any]:
     """Serialize messages, system instructions, and tool definitions into attributes.
 
     Args:
         input_messages: Input messages to serialize.
         output_messages: Output messages to serialize.
-        system_instruction: System instructions to serialize.
+        system_instruction: System instructions to serialize. Passing ``MessagePart``
+            is deprecated; use ``SystemInstructionPart``.
         tool_definitions: Tool definitions to serialize (may be None).
+        prompt_variables: Prompt template variables to serialize (may be None).
         for_span: If True, serialize for span attributes (JSON string);
                   if False, serialize for event attributes (list of dicts).
+        content_capturing_mode: Configured content capturing mode; if None,
+                                reads from environment.
     """
-    mode = get_content_capturing_mode()
+    mode = (
+        get_content_capturing_mode()
+        if content_capturing_mode is None
+        else content_capturing_mode
+    )
     allowed_modes = (
         (
             ContentCapturingMode.SPAN_ONLY,
@@ -261,14 +374,8 @@ def get_content_attributes(
         dicts = [asdict(item) for item in items]
         return gen_ai_json_dumps(dicts) if for_span else dicts
 
-    # Tool definitions are always captured, the sem conv recommends adding params / description only
-    # when the content capture mode is set..
     if mode not in allowed_modes:
-        return (
-            {GenAI.GEN_AI_TOOL_DEFINITIONS: serialize(tool_definitions)}
-            if tool_definitions
-            else {}
-        )
+        return {}
 
     optional_attrs = (
         (
@@ -288,4 +395,10 @@ def get_content_attributes(
             serialize(tool_definitions) if tool_definitions else None,
         ),
     )
-    return {key: value for key, value in optional_attrs if value is not None}
+    result = {key: value for key, value in optional_attrs if value is not None}
+    if prompt_variables:
+        for k, v in prompt_variables.items():
+            result[f"{_GEN_AI_PROMPT_VARIABLE_PREFIX}{k}"] = (
+                v if isinstance(v, str) else gen_ai_json_dumps(v)
+            )
+    return result

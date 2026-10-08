@@ -28,12 +28,12 @@ MAXSIZE = 5
 FAKE_INPUTS = [
     types.InputMessage(
         role="user",
-        parts=[types.Text(content="What is the capital of France?")],
+        parts=[types.TextPart(content="What is the capital of France?")],
     ),
     types.InputMessage(
         role="assistant",
         parts=[
-            types.ToolCallRequest(
+            types.ToolCallRequestPart(
                 id="get_capital_0",
                 name="get_capital",
                 arguments={"city": "Paris"},
@@ -43,7 +43,7 @@ FAKE_INPUTS = [
     types.InputMessage(
         role="user",
         parts=[
-            types.ToolCallResponse(
+            types.ToolCallResponsePart(
                 id="get_capital_0", response={"capital": "Paris"}
             )
         ],
@@ -52,11 +52,13 @@ FAKE_INPUTS = [
 FAKE_OUTPUTS = [
     types.OutputMessage(
         role="assistant",
-        parts=[types.Text(content="Paris")],
+        parts=[types.TextPart(content="Paris")],
         finish_reason="stop",
     ),
 ]
-FAKE_SYSTEM_INSTRUCTION = [types.Text(content="You are a helpful assistant.")]
+FAKE_SYSTEM_INSTRUCTION = [
+    types.TextPart(content="You are a helpful assistant.")
+]
 
 FAKE_TOOL_DEFINITIONS: list[types.ToolDefinition] = [
     types.FunctionToolDefinition(
@@ -174,7 +176,7 @@ class TestUploadCompletionHook(TestCase):
             self.hook.on_completion(
                 inputs=[],
                 outputs=[],
-                system_instruction=[types.Text(content=str(iteration))],
+                system_instruction=[types.TextPart(content=str(iteration))],
                 tool_definitions=[],
             )
         self.hook.shutdown()
@@ -351,8 +353,8 @@ class TestUploadCompletionHookIntegration(TestBase):
         # FIle should exist.
         self.assertTrue(self.hook._file_exists(expected_file_name))
         system_instructions = [
-            types.Text(content="You are a helpful assistant."),
-            types.Text(content="You will do your best."),
+            types.TextPart(content="You are a helpful assistant."),
+            types.TextPart(content="You will do your best."),
         ]
         record = LogRecord()
         self.hook.on_completion(
@@ -442,11 +444,11 @@ class TestUploadCompletionHookIntegration(TestBase):
 
         self.assert_fsspec_equal(
             span.attributes["gen_ai.input.messages_ref"],
-            '[{"role":"user","parts":[{"content":"What is the capital of France?","type":"text"}]},{"role":"assistant","parts":[{"arguments":{"city":"Paris"},"name":"get_capital","id":"get_capital_0","type":"tool_call"}]},{"role":"user","parts":[{"response":{"capital":"Paris"},"id":"get_capital_0","type":"tool_call_response"}]}]\n',
+            '[{"role":"user","parts":[{"content":"What is the capital of France?","type":"text"}],"name":null},{"role":"assistant","parts":[{"arguments":{"city":"Paris"},"name":"get_capital","id":"get_capital_0","type":"tool_call"}],"name":null},{"role":"user","parts":[{"response":{"capital":"Paris"},"id":"get_capital_0","type":"tool_call_response"}],"name":null}]\n',
         )
         self.assert_fsspec_equal(
             span.attributes["gen_ai.output.messages_ref"],
-            '[{"role":"assistant","parts":[{"content":"Paris","type":"text"}],"finish_reason":"stop"}]\n',
+            '[{"role":"assistant","parts":[{"content":"Paris","type":"text"}],"finish_reason":"stop","name":null}]\n',
         )
         self.assert_fsspec_equal(
             span.attributes["gen_ai.system_instructions_ref"],
@@ -480,7 +482,9 @@ class TestUploadCompletionHookIntegration(TestBase):
                 types.InputMessage(
                     role="user",
                     parts=[
-                        types.Text(content="What is the capital of France?"),
+                        types.TextPart(
+                            content="What is the capital of France?"
+                        ),
                         {"type": "generic_bytes", "bytes": b"hello"},
                     ],
                 )
@@ -494,7 +498,7 @@ class TestUploadCompletionHookIntegration(TestBase):
 
         self.assert_fsspec_equal(
             log_record.attributes["gen_ai.input.messages_ref"],
-            '[{"role":"user","parts":[{"content":"What is the capital of France?","type":"text"},{"type":"generic_bytes","bytes":"aGVsbG8="}]}]\n',
+            '[{"role":"user","parts":[{"content":"What is the capital of France?","type":"text"},{"type":"generic_bytes","bytes":"aGVsbG8="}],"name":null}]\n',
         )
 
     def test_upload_json(self) -> None:
@@ -518,7 +522,7 @@ class TestUploadCompletionHookIntegration(TestBase):
 
         self.assert_fsspec_equal(
             ref_uri,
-            '[{"role":"user","parts":[{"content":"What is the capital of France?","type":"text"}]},{"role":"assistant","parts":[{"arguments":{"city":"Paris"},"name":"get_capital","id":"get_capital_0","type":"tool_call"}]},{"role":"user","parts":[{"response":{"capital":"Paris"},"id":"get_capital_0","type":"tool_call_response"}]}]\n',
+            '[{"role":"user","parts":[{"content":"What is the capital of France?","type":"text"}],"name":null},{"role":"assistant","parts":[{"arguments":{"city":"Paris"},"name":"get_capital","id":"get_capital_0","type":"tool_call"}],"name":null},{"role":"user","parts":[{"response":{"capital":"Paris"},"id":"get_capital_0","type":"tool_call_response"}],"name":null}]\n',
         )
 
     def test_upload_jsonlines(self) -> None:
@@ -543,9 +547,9 @@ class TestUploadCompletionHookIntegration(TestBase):
         self.assert_fsspec_equal(
             ref_uri,
             """\
-{"role":"user","parts":[{"content":"What is the capital of France?","type":"text"}],"index":0}
-{"role":"assistant","parts":[{"arguments":{"city":"Paris"},"name":"get_capital","id":"get_capital_0","type":"tool_call"}],"index":1}
-{"role":"user","parts":[{"response":{"capital":"Paris"},"id":"get_capital_0","type":"tool_call_response"}],"index":2}
+{"role":"user","parts":[{"content":"What is the capital of France?","type":"text"}],"name":null,"index":0}
+{"role":"assistant","parts":[{"arguments":{"city":"Paris"},"name":"get_capital","id":"get_capital_0","type":"tool_call"}],"name":null,"index":1}
+{"role":"user","parts":[{"response":{"capital":"Paris"},"id":"get_capital_0","type":"tool_call_response"}],"name":null,"index":2}
 """,
         )
 

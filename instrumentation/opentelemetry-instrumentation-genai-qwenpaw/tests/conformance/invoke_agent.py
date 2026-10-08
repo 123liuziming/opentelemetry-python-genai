@@ -34,17 +34,11 @@ from opentelemetry.test_util_genai.instrumentor import instrument
 
 
 class InvokeAgentScenario(Scenario):
-    # The specific attribute values (agent id/name, conversation id, message
+    # The specific attribute values (agent name, conversation id, message
     # content) are covered by unit tests; conformance only validates the
     # telemetry shape against the semconv registry.
     expected_spans = {"invoke_agent": 1}
-    # The invoke_agent span is an INTERNAL agent invocation, not a streamed
-    # client call, so it records only the operation duration — no
-    # streamed-call metrics (time_to_first_chunk and friends) apply.
-    # gen_ai.provider.name was relaxed to conditionally-required on both the
-    # span and the metric, and QwenPaw delegates model calls to AgentScope,
-    # so no violations are expected.
-    expected_metrics = ("gen_ai.client.operation.duration",)
+    expected_metrics = ("gen_ai.invoke_agent.duration",)
 
     def run(
         self,

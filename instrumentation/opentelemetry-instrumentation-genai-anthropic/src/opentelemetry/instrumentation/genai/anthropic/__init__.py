@@ -43,6 +43,7 @@ from typing import Any
 
 from wrapt import wrap_function_wrapper
 
+from opentelemetry.instrumentation.genai.anthropic.version import __version__
 from opentelemetry.instrumentation.instrumentor import BaseInstrumentor
 from opentelemetry.instrumentation.utils import unwrap
 from opentelemetry.util.genai.completion_hook import load_completion_hook
@@ -52,8 +53,10 @@ from .package import _instruments
 from .patch import (
     async_messages_create,
     async_messages_stream,
+    async_response_context_manager_exit,
     messages_create,
     messages_stream,
+    response_context_manager_exit,
 )
 
 
@@ -112,6 +115,8 @@ class AnthropicInstrumentor(BaseInstrumentor):
             logger_provider=logger_provider,
             completion_hook=kwargs.get("completion_hook")
             or load_completion_hook(),
+            instrumentation_scope_name=__package__,
+            instrumentation_scope_version=__version__,
         )
 
         wrap_function_wrapper(
@@ -133,6 +138,16 @@ class AnthropicInstrumentor(BaseInstrumentor):
             "anthropic.resources.messages",
             "AsyncMessages.stream",
             async_messages_stream(handler),
+        )
+        wrap_function_wrapper(
+            "anthropic._response",
+            "ResponseContextManager.__exit__",
+            response_context_manager_exit,
+        )
+        wrap_function_wrapper(
+            "anthropic._response",
+            "AsyncResponseContextManager.__aexit__",
+            async_response_context_manager_exit,
         )
 
         # parse() wraps create() internally in the Anthropic SDK and returns a
@@ -174,6 +189,13 @@ class AnthropicInstrumentor(BaseInstrumentor):
             anthropic.resources.messages.AsyncMessages,  # pyright: ignore[reportAttributeAccessIssue,reportUnknownMemberType,reportUnknownArgumentType]
             "stream",
         )
+        from anthropic._response import (  # pylint: disable=import-outside-toplevel
+            AsyncResponseContextManager,
+            ResponseContextManager,
+        )
+
+        unwrap(ResponseContextManager, "__exit__")
+        unwrap(AsyncResponseContextManager, "__aexit__")
         if self._parse_supported:
             unwrap(
                 anthropic.resources.messages.Messages,  # pyright: ignore[reportAttributeAccessIssue,reportUnknownMemberType,reportUnknownArgumentType]
