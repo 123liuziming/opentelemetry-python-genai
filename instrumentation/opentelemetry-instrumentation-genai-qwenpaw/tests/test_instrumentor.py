@@ -12,7 +12,7 @@ from opentelemetry.instrumentation.genai.qwenpaw import QwenPawInstrumentor
 
 def test_instrumentor_targets_qwenpaw_distribution():
     assert QwenPawInstrumentor().instrumentation_dependencies() == (
-        "qwenpaw >= 1.1.0, < 2.0.0",
+        "qwenpaw >= 1.1.0, < 2.0.0; python_version < '3.14'",
     )
 
 
