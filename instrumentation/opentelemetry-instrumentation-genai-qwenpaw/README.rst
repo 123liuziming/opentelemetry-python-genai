@@ -21,10 +21,11 @@ last emitted assistant message is complete. Closing a partial message
 preserves captured output without reporting a finish reason. Local agent
 turns record the ``gen_ai.invoke_agent.duration`` metric.
 
-With ``opentelemetry-util-genai`` 1.2b0, callers must drain or explicitly close
-the stream to end its span. Finalization of abandoned streams requires the
-shared utility fix tracked in `issue #386
-<https://github.com/open-telemetry/opentelemetry-python-genai/issues/386>`_.
+Abandoning a partially consumed stream ends its span during garbage
+collection with ``error.type`` set to ``_OTHER`` and the status description
+``abandoned stream``. Captured partial output is preserved without reporting
+a finish reason. This requires ``opentelemetry-util-genai`` 1.3b0 or newer
+(``1.3b0.dev`` from this workspace during development).
 
 QwenPaw delegates model (LLM) and tool execution to AgentScope, so this
 package emits no ``chat`` or ``execute_tool`` spans and its conformance

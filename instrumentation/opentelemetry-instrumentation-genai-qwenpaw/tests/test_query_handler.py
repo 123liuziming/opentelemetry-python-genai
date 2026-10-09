@@ -8,17 +8,16 @@ from __future__ import annotations
 import asyncio
 import gc
 import json
+from collections.abc import AsyncIterator
 from types import AsyncGeneratorType
 
 import pytest
-from packaging.version import Version
 
 from opentelemetry.semconv._incubating.attributes import (
     gen_ai_attributes as GenAI,
 )
 from opentelemetry.semconv.attributes import error_attributes
-from opentelemetry.trace import SpanKind, StatusCode
-from opentelemetry.util.genai.version import __version__ as util_genai_version
+from opentelemetry.trace import SpanKind, StatusCode, get_current_span
 
 from .harness import (
     assistant_reply,
@@ -337,12 +336,47 @@ async def test_partial_or_non_assistant_output_omits_finish_reason(
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    Version(util_genai_version) < Version("1.3b0.dev"),
-    reason="Shared stream abandonment finalization requires util-genai 1.3b0.dev (#386)",
-    strict=True,
-    run=False,
-)
+async def test_break_mid_stream_finalizes_span_and_restores_context(
+    instrument_no_content, runner_module, span_exporter, tracer_provider
+) -> None:
+    async def multi_chunk(
+        request: object, msgs: object, runner: object
+    ) -> AsyncIterator[tuple[object, bool]]:
+        del request, msgs, runner
+        for i in range(3):
+            yield assistant_reply(f"chunk-{i}"), i == 2
+
+    runner = runner_module.AgentRunner(agent_id="entry-agent")
+    tracer = tracer_provider.get_tracer(__name__)
+    with tracer.start_as_current_span("parent") as parent:
+        with patched_command_path(runner_module, multi_chunk):
+            async for _ in runner.query_handler(
+                user_command_msgs(), make_request()
+            ):
+                break
+            gc.collect()
+
+            (span,) = span_exporter.get_finished_spans()
+            assert span.name.startswith("invoke_agent")
+            assert span.status.status_code == StatusCode.ERROR
+            assert span.status.description == "abandoned stream"
+            assert span.attributes[error_attributes.ERROR_TYPE] == "_OTHER"
+            assert span.parent == parent.get_span_context()
+            assert get_current_span() is parent
+
+            with tracer.start_as_current_span("following") as following:
+                pass
+            await asyncio.sleep(0)
+
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 3
+    following_span = next(
+        span for span in spans if span.context == following.get_span_context()
+    )
+    assert following_span.parent == parent.get_span_context()
+
+
+@pytest.mark.asyncio
 async def test_abandoned_stream_finalizes_span_with_partial_output(
     instrument_with_content, runner_module, span_exporter
 ) -> None:
@@ -357,6 +391,7 @@ async def test_abandoned_stream_finalizes_span_with_partial_output(
         assert span_exporter.get_finished_spans() == ()
         del stream
         gc.collect()
+        assert len(span_exporter.get_finished_spans()) == 1
         await underlying.aclose()
 
     (span,) = span_exporter.get_finished_spans()
