@@ -15,6 +15,9 @@ name (``gen_ai.agent.name``, when already cached by the runner), the session id
 (``gen_ai.conversation.id``), and — when content capture is enabled — the
 turn's input and output messages.
 
+The request's session ID is propagated to nested GenAI invocations through
+OpenTelemetry context.
+
 The span remains open until the response stream is drained or closed.
 Successful finalization records ``gen_ai.response.finish_reasons`` when the
 last emitted assistant message is complete. Closing a partial message

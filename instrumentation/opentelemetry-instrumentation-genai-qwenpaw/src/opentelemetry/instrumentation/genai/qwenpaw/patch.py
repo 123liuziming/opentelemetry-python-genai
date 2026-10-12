@@ -83,13 +83,11 @@ def _build_invocation(
 ) -> LocalAgentInvocation:
     # The public agent_name property lazily loads configuration from disk.
     agent_name = non_empty_str(getattr(instance, "_agent_name", None))
-    invocation = handler.invoke_local_agent(agent_name=agent_name)
-    # The runner's `agent_id` is a local config key (e.g. "default"), not a
-    # provider-assigned stable identifier, so `gen_ai.agent.id` is not
-    # recorded per its semconv guidance.
-    conversation_id = non_empty_str(getattr(request, "session_id", None))
-    if conversation_id is not None:
-        invocation.conversation_id = conversation_id
+    # The runner's agent_id is a local config key, not a provider-assigned ID.
+    invocation = handler.invoke_local_agent(
+        agent_name=agent_name,
+        conversation_id=non_empty_str(getattr(request, "session_id", None)),
+    )
     if invocation.should_capture_content:
         invocation.input_messages = input_messages_from_msgs(msgs)
     return invocation

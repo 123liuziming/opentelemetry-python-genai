@@ -19,6 +19,48 @@ from opentelemetry.util.genai.handler import TelemetryHandler
 from opentelemetry.util.genai.invocation import LocalAgentInvocation
 
 
+@pytest.mark.parametrize("outer_conversation_id", [None, "outer-session"])
+def test_request_session_propagates_to_nested_invocations(
+    outer_conversation_id: str | None,
+    tracer_provider: TracerProvider,
+    span_exporter: InMemorySpanExporter,
+) -> None:
+    handler = TelemetryHandler(tracer_provider=tracer_provider)
+    with handler.invoke_local_agent(
+        agent_name="outer", conversation_id=outer_conversation_id
+    ):
+        with _build_invocation(
+            handler,
+            SimpleNamespace(),
+            None,
+            SimpleNamespace(session_id="request-session"),
+        ):
+            with handler.invoke_local_agent(agent_name="nested"):
+                pass
+            with handler.inference(
+                GenAI.GenAiProviderNameValues.OPENAI.value,
+                request_model="test-model",
+            ):
+                pass
+        with handler.invoke_local_agent(agent_name="following"):
+            pass
+
+    spans = {span.name: span for span in span_exporter.get_finished_spans()}
+    assert len(spans) == 5
+    agent_span = spans["invoke_agent"]
+    for name in ("invoke_agent", "invoke_agent nested", "chat test-model"):
+        conversation_id = spans[name].attributes[GenAI.GEN_AI_CONVERSATION_ID]
+        assert conversation_id == "request-session"
+        assert isinstance(conversation_id, str)
+    for name in ("invoke_agent nested", "chat test-model"):
+        assert spans[name].parent == agent_span.context
+    for name in ("invoke_agent outer", "invoke_agent following"):
+        assert (
+            spans[name].attributes.get(GenAI.GEN_AI_CONVERSATION_ID)
+            == outer_conversation_id
+        )
+
+
 @pytest.mark.parametrize("cached_name", [None, "cached-agent"])
 def test_agent_name_does_not_load_configuration(
     cached_name: str | None,
