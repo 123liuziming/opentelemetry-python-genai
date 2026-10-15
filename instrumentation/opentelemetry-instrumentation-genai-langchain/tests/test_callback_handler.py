@@ -339,8 +339,14 @@ async def test_chain_classification_and_completion(
                 AIMessage(content="final answer"),
             ]
         },
+        {
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "final answer"},
+            ]
+        },
     ],
-    ids=["empty", "no-assistant", "last-assistant"],
+    ids=["empty", "no-assistant", "last-assistant", "dict-assistant"],
 )
 async def test_chain_input_and_output_capture(
     asynchronous: bool,
@@ -364,10 +370,10 @@ async def test_chain_input_and_output_capture(
         assert json.loads(captured[0]["parts"][0]["content"]) == inputs
     else:
         assert GenAI.GEN_AI_INPUT_MESSAGES not in attrs
-    if (
-        content_capture == ContentCapturingMode.SPAN_ONLY
-        and outputs.get("messages")
-        and isinstance(outputs["messages"][-1], AIMessage)
+    last = (outputs.get("messages") or [None])[-1]
+    if content_capture == ContentCapturingMode.SPAN_ONLY and (
+        isinstance(last, AIMessage)
+        or (isinstance(last, dict) and last.get("role") == "assistant")
     ):
         captured = json.loads(attrs[GenAI.GEN_AI_OUTPUT_MESSAGES])
         assert len(captured) == 1
@@ -1453,6 +1459,19 @@ class TestMakeInputMessage:
         assert len(result) == 1
         assert result[0].parts[0].content == "Hi"
 
+    def test_messages_key_malformed_entry_keeps_convertible_entries(self):
+        result = make_input_message(
+            {
+                "messages": [
+                    {"role": "user", "content": "Hello"},
+                    ("human",),
+                    HumanMessage(content="Hi"),
+                ]
+            }
+        )
+
+        assert [m.parts[0].content for m in result] == ["Hello", "Hi"]
+
     def test_messages_key_all_malformed_returns_empty_without_raising(self):
         result = make_input_message(
             {"messages": [("human",), None, {"content": "x"}]}
@@ -1548,6 +1567,36 @@ class TestMakeOutputMessage:
         assert result[0].finish_reason == ""
         assert result[0].parts[0].content == "The answer is 42"
 
+    @pytest.mark.parametrize(
+        "assistant_entry",
+        [
+            {"role": "assistant", "content": "Hello"},
+            ("ai", "Hello"),
+        ],
+    )
+    def test_message_like_assistant_entry_produces_assistant_output(
+        self, assistant_entry
+    ):
+        result = make_output_message({"messages": [assistant_entry]})
+
+        assert len(result) == 1
+        assert result[0].role == "assistant"
+        assert result[0].parts[0].content == "Hello"
+
+    def test_malformed_entry_keeps_convertible_assistant_entries(self):
+        result = make_output_message(
+            {
+                "messages": [
+                    {"role": "not_a_real_role", "content": "dropped"},
+                    None,
+                    {"role": "assistant", "content": "kept"},
+                ]
+            }
+        )
+
+        assert len(result) == 1
+        assert result[0].parts[0].content == "kept"
+
     def test_non_ai_message_skipped(self):
         human_msg = HumanMessage(content="Hello")
         result = make_output_message({"messages": [human_msg]})
@@ -1620,6 +1669,16 @@ class TestMakeLastOutputMessage:
         msgs = [
             AIMessage(content="intermediate"),
             AIMessage(content="final answer"),
+        ]
+        result = make_last_output_message({"messages": msgs})
+
+        assert len(result) == 1
+        assert result[0].parts[0].content == "final answer"
+
+    def test_returns_last_assistant_message_in_dict_form(self):
+        msgs = [
+            AIMessage(content="intermediate"),
+            {"role": "assistant", "content": "final answer"},
         ]
         result = make_last_output_message({"messages": msgs})
 
