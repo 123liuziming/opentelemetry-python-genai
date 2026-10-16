@@ -170,3 +170,18 @@ def wrap_agent_call_tool(
         invocation.tool_result = object_to_any_value(result)
     invocation.stop()
     return result
+
+
+def wrap_fncall_agent_call_tool(
+    wrapped: Callable[..., Any],
+    instance: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> Any:
+    """Count unknown tools that FnCallAgent returns without delegating to Agent."""
+    tool_name = get_argument("tool_name", wrapped, args, kwargs)
+    if tool_name not in instance.function_map:
+        invocation = _active_invocation(instance)
+        if invocation is not None:
+            invocation.tool_calls = (invocation.tool_calls or 0) + 1
+    return wrapped(*args, **kwargs)

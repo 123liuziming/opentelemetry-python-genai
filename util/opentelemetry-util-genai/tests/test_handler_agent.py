@@ -794,6 +794,33 @@ class TestAgentInvocationMetrics(TestBase):
                 points[0].attributes, {GenAI.GEN_AI_AGENT_NAME: "Counter"}
             )
 
+    def test_local_agent_call_counts_include_custom_metric_attributes(
+        self,
+    ) -> None:
+        handler = TelemetryHandler(
+            tracer_provider=self.tracer_provider,
+            meter_provider=self.meter_provider,
+        )
+        invocation = handler.invoke_local_agent(agent_name="Counter")
+        invocation.metric_attributes["deployment.environment"] = "staging"
+        invocation.inference_calls = 3
+        invocation.tool_calls = 2
+        invocation.stop()
+
+        metrics = self._harvest_metrics()
+        for name in (
+            "gen_ai.invoke_agent.duration",
+            "gen_ai.invoke_agent.inference_calls",
+            "gen_ai.invoke_agent.tool_calls",
+        ):
+            self.assertEqual(
+                metrics[name][0].attributes,
+                {
+                    GenAI.GEN_AI_AGENT_NAME: "Counter",
+                    "deployment.environment": "staging",
+                },
+            )
+
     def test_local_agent_records_zero_calls_on_failure(self) -> None:
         handler = TelemetryHandler(
             tracer_provider=self.tracer_provider,

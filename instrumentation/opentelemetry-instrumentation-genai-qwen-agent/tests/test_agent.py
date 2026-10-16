@@ -139,6 +139,36 @@ def test_agent_run_counts_failed_inference_and_tool(
     )
 
 
+def test_assistant_counts_unknown_and_known_tool_calls_once(
+    metric_reader, instrument_no_content
+):
+    agent = Assistant(
+        llm={"model": "qwen-max", "model_type": "qwen_dashscope"},
+        name="AssistantCounter",
+    )
+    agent.function_map["known"] = SimpleNamespace(
+        file_access=False,
+        call=lambda *_args, **_kwargs: "ok",
+        description="A test tool",
+    )
+
+    def fake_run(messages, **kwargs):
+        assert (
+            agent._call_tool("missing", "{}")
+            == "Tool missing does not exists."
+        )
+        assert agent._call_tool("known", "{}") == "ok"
+        yield [Message(role="assistant", content="done")]
+
+    with patch.object(agent, "_run", side_effect=fake_run):
+        list(agent.run([Message(role="user", content="Go")]))
+
+    points = _metric_points(metric_reader, "gen_ai.invoke_agent.tool_calls")
+    assert len(points) == 1
+    assert points[0].sum == 2
+    assert isinstance(points[0].sum, int)
+
+
 def test_nested_agent_call_counts_are_separate(
     metric_reader, instrument_no_content
 ):

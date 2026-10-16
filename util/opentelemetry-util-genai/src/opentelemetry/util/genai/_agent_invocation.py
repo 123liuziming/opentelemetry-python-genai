@@ -253,11 +253,12 @@ class LocalAgentInvocation(AgentInvocation):
             attributes=self._get_metric_attributes(),
             context=self._span_context,
         )
-        count_attributes = (
+        count_attributes: dict[str, AttributeValue] = (
             {GenAI.GEN_AI_AGENT_NAME: self._agent_name}
             if self._agent_name is not None
             else {}
         )
+        count_attributes.update(self.metric_attributes)
         if self.inference_calls is not None:
             self._instruments.invoke_agent_inference_calls.record(
                 self.inference_calls,
