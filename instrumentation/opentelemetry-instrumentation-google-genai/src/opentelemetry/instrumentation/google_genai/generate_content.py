@@ -36,6 +36,7 @@ from opentelemetry.util.genai.stream import (
 from opentelemetry.util.genai.types import (
     FunctionToolDefinition,
     GenericToolDefinition,
+    InputMessage,
     ModalityTokens,
     ToolDefinition,
 )
@@ -469,6 +470,16 @@ def _apply_response_attributes(
         )
 
 
+def _to_input_messages(
+    contents: ContentListUnion | ContentListUnionDict | None,
+) -> list[InputMessage]:
+    contents = _normalize_to_list_if_tuple(contents)
+    # t_contents rejects None and empty lists before the wrapped SDK call runs.
+    if contents is None or (isinstance(contents, list) and not contents):
+        return []
+    return to_input_messages(contents=transformers.t_contents(contents))
+
+
 def _maybe_get_tool_definitions(
     config: GenerateContentConfig,
 ) -> list[ToolDefinition]:
@@ -537,11 +548,7 @@ def _create_instrumented_generate_content(
                 )
 
                 if telemetry_handler.should_capture_content():
-                    invocation.input_messages = to_input_messages(
-                        contents=transformers.t_contents(
-                            _normalize_to_list_if_tuple(contents)
-                        )
-                    )
+                    invocation.input_messages = _to_input_messages(contents)
                     if wrapped_config.system_instruction:
                         invocation.system_instruction = to_system_instructions(
                             content=transformers.t_contents(
@@ -700,11 +707,7 @@ def _create_instrumented_generate_content_stream(
             )
 
             if telemetry_handler.should_capture_content():
-                invocation.input_messages = to_input_messages(
-                    contents=transformers.t_contents(
-                        _normalize_to_list_if_tuple(contents)
-                    )
-                )
+                invocation.input_messages = _to_input_messages(contents)
                 if wrapped_config.system_instruction:
                     invocation.system_instruction = to_system_instructions(
                         content=transformers.t_contents(
@@ -776,11 +779,7 @@ def _create_instrumented_async_generate_content(
                 )
 
                 if telemetry_handler.should_capture_content():
-                    invocation.input_messages = to_input_messages(
-                        contents=transformers.t_contents(
-                            _normalize_to_list_if_tuple(contents)
-                        )
-                    )
+                    invocation.input_messages = _to_input_messages(contents)
                     if wrapped_config.system_instruction:
                         invocation.system_instruction = to_system_instructions(
                             content=transformers.t_contents(
@@ -863,11 +862,7 @@ def _create_instrumented_async_generate_content_stream(  # type: ignore
             )
 
             if telemetry_handler.should_capture_content():
-                invocation.input_messages = to_input_messages(
-                    contents=transformers.t_contents(
-                        _normalize_to_list_if_tuple(contents)
-                    )
-                )
+                invocation.input_messages = _to_input_messages(contents)
                 if wrapped_config.system_instruction:
                     invocation.system_instruction = to_system_instructions(
                         content=transformers.t_contents(
