@@ -232,6 +232,9 @@ class LocalAgentInvocation(AgentInvocation):
             conversation_id=conversation_id,
         )
 
+    def _on_stream_chunk(self, chunk_at: float) -> None:
+        """Local agent streams scope context without inference chunk timing metrics."""
+
     def _get_metric_attributes(self) -> dict[str, AttributeValue]:
         attrs: dict[str, AttributeValue] = {}
         if self._agent_name is not None:
