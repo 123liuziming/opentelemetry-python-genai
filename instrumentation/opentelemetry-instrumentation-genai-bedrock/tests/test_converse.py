@@ -608,14 +608,10 @@ def test_extract_converse_request_guardrail_and_prompt_variables(
             == "sgi5gkybzqak"
         )
         assert invocation.output_type == "json"
-        assert (
-            invocation.attributes.get("gen_ai.prompt.variable.user_name")
-            == "Alice"
-        )
-        assert (
-            invocation.attributes.get("gen_ai.prompt.variable.language")
-            == "French"
-        )
+        assert invocation.prompt_variables == {
+            "user_name": "Alice",
+            "language": "French",
+        }
 
 
 def test_extract_converse_request_prompt_variables_no_content(
@@ -640,7 +636,7 @@ def test_extract_converse_request_prompt_variables_no_content(
             invocation.attributes.get(AwsAttributes.AWS_BEDROCK_GUARDRAIL_ID)
             == "sgi5gkybzqak"
         )
-        assert "gen_ai.prompt.variable.user_name" not in invocation.attributes
+        assert invocation.prompt_variables is None
 
 
 def test_extract_converse_request_system_instruction(tracer_provider) -> None:
