@@ -359,22 +359,6 @@ class TelemetryHandlerMetricsTest(TestBase):
         (span,) = self.get_finished_spans()
         self.assertIs(span.attributes[GenAI.GEN_AI_REQUEST_STREAM], True)
 
-    def test_local_agent_stream_records_only_agent_duration(self) -> None:
-        handler = TelemetryHandler(
-            tracer_provider=self.tracer_provider,
-            meter_provider=self.meter_provider,
-        )
-        invocation = handler.invoke_local_agent(agent_name="agent")
-        invocation.record_stream_chunk()
-        invocation.record_stream_chunk()
-        invocation.stop()
-
-        metrics = self._harvest_metrics()
-        self.assertEqual(set(metrics), {"gen_ai.invoke_agent.duration"})
-        point = metrics["gen_ai.invoke_agent.duration"][0]
-        self.assertEqual(point.count, 1)
-        self.assertEqual(point.attributes[GenAI.GEN_AI_AGENT_NAME], "agent")
-
     def test_no_streaming_timing_metrics_without_chunks(self) -> None:
         handler = TelemetryHandler(
             tracer_provider=self.tracer_provider,

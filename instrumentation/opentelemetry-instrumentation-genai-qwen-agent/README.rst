@@ -52,8 +52,7 @@ Usage
 The agent span remains open until the run iterator is exhausted or closed.
 It is current only while the agent executes or the iterator is cleaned up;
 caller work between responses keeps the caller's context. Close the iterator
-when stopping early. Agent streams record agent duration without LLM chunk
-timing metrics.
+when stopping early.
 
 Message content capture is disabled by default. Set
 ``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`` to one of

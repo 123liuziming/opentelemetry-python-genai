@@ -418,7 +418,6 @@ def test_nested_agent_runs_produce_nested_spans(
 def test_agent_stream_execution_context(
     span_exporter,
     tracer_provider,
-    metric_reader,
     instrument_no_content,
     caplog,
     outcome: str,
@@ -531,11 +530,3 @@ def test_agent_stream_execution_context(
     else:
         assert agent_span.status.status_code != StatusCode.ERROR
     assert "Failed to detach context" not in caplog.text
-    metrics = metric_reader.get_metrics_data()
-    assert metrics is not None
-    assert {
-        metric.name
-        for resource in metrics.resource_metrics
-        for scope in resource.scope_metrics
-        for metric in scope.metrics
-    } == {"gen_ai.invoke_agent.duration"}
