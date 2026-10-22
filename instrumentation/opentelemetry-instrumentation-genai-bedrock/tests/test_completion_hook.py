@@ -136,6 +136,66 @@ def test_prompt_variables_follow_content_capture_with_hook(
         assert "gen_ai.input.messages" not in event_attrs
 
 
+def test_stream_prompt_variables_not_recorded_with_hook_and_no_content(
+    span_exporter,
+    log_exporter,
+    tracer_provider,
+    logger_provider,
+    meter_provider,
+    bedrock_client,
+) -> None:
+    hook = MagicMock()
+    params = {
+        "modelId": "amazon.nova-micro-v1:0",
+        "messages": [{"role": "user", "content": [{"text": "Hello"}]}],
+        "promptVariables": {"user_name": {"text": "Alice"}},
+    }
+    events = [
+        {"messageStart": {"role": "assistant"}},
+        {
+            "contentBlockDelta": {
+                "contentBlockIndex": 0,
+                "delta": {"text": "Hi"},
+            }
+        },
+        {"messageStop": {"stopReason": "end_turn"}},
+    ]
+    with Stubber(bedrock_client) as stubber:
+        # botocore cannot validate an EventStream iterator against the output shape.
+        stubber._validate_response = lambda *args, **kwargs: None
+        stubber.add_response(
+            "converse_stream", {"stream": iter(events)}, params
+        )
+        with instrument(
+            BedrockInstrumentor(),
+            tracer_provider=tracer_provider,
+            logger_provider=logger_provider,
+            meter_provider=meter_provider,
+            content_capture="NO_CONTENT",
+            emit_event=True,
+            completion_hook=hook,
+        ):
+            response = bedrock_client.converse_stream(**params)
+            assert list(response["stream"]) == events
+
+    hook.on_completion.assert_called_once()
+    assert hook.on_completion.call_args.kwargs["inputs"]
+    assert hook.on_completion.call_args.kwargs["outputs"]
+    spans = span_exporter.get_finished_spans()
+    assert len(spans) == 1
+    span_attrs = spans[0].attributes or {}
+    assert "gen_ai.prompt.variable.user_name" not in span_attrs
+    assert "gen_ai.input.messages" not in span_attrs
+    assert "gen_ai.output.messages" not in span_attrs
+
+    logs = log_exporter.get_finished_logs()
+    assert len(logs) == 1
+    event_attrs = logs[0].log_record.attributes or {}
+    assert "gen_ai.prompt.variable.user_name" not in event_attrs
+    assert "gen_ai.input.messages" not in event_attrs
+    assert "gen_ai.output.messages" not in event_attrs
+
+
 @patch.dict(
     os.environ,
     {OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: "span_only"},
